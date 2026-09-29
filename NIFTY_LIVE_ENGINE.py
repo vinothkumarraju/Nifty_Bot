@@ -55,8 +55,8 @@ The workflow should git-add/commit/push runtime/ and logs/ after every run.
 
 CAS option-management defaults
 ------------------------------
-If an strategy position is still open and CAS-referenced spot P&L is >= +70 points,
-send an option-management alert to harvest 80% and leave a 20% runner.
+If an open strategy child reaches +70 spot points, roll it into a fresh ITM3.
+Also roll a child at the two-session age boundary while the parent remains active.
 These are live-execution management defaults only; they do NOT alter the
 backtest strategy research engine.
 
@@ -73,8 +73,6 @@ NIFTY_CACHE_DAYS               default 90
 NIFTY_ALERT_LOOKBACK_MIN       default 15
 NIFTY_STATUS_MINUTES           default 30
 NIFTY_CAS_HARVEST_TRIGGER      default 70
-NIFTY_CAS_HARVEST_PERCENT      default 80
-NIFTY_CAS_RUNNER_PERCENT       default 20
 NIFTY_EVENT_LOG                default logs/nifty_trade_events.csv
 NIFTY_STATUS_LOG               default logs/nifty_status_30m.csv
 NIFTY_CAS_LOG                  default logs/nifty_cas_management.csv
@@ -110,7 +108,7 @@ import numpy as np
 import pandas as pd
 
 ENGINE_VERSION = "ENGINE"
-EXPECTED_ENGINE_SHA256 = "73ccfbce6669bd07e984fcdcb810255c658de79d2cd374aef6332698c11b82d7"
+EXPECTED_ENGINE_SHA256 = "214c4f37843bdb515244af1c0c4bdfcf4aad432664acca83ac6d522d201e2d8b"
 
 LIVE_WINDOW_START = dtime(9, 0)
 STRATEGY_START = dtime(9, 15)
@@ -330,7 +328,7 @@ def bounded_add(items: List[str], key: str, max_items: int = 5000) -> None:
 # Exact strategy engine loading + live-final-period adapters
 # ---------------------------------------------------------------------------
 
-def load_r2_engine(engine_path: Path):
+def load_strategy_engine(engine_path: Path):
     if not engine_path.exists():
         raise FileNotFoundError(engine_path)
 
@@ -344,7 +342,7 @@ def load_r2_engine(engine_path: Path):
             "NIFTY_ALLOW_SHA_MISMATCH=1 after reviewing the change."
         )
 
-    spec = importlib.util.spec_from_file_location("r2_exact_live", engine_path)
+    spec = importlib.util.spec_from_file_location("nifty_strategy_live", engine_path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Cannot import {engine_path}")
     mod = importlib.util.module_from_spec(spec)
@@ -475,7 +473,7 @@ def build_live_snapshot(strategy, data: pd.DataFrame) -> Tuple[List[LiveTrade], 
     # Use a temporary CSV because strategy.init() accepts CSV/ZIP paths.
     runtime_dir = Path(os.getenv("NIFTY_RUNTIME_DIR", "runtime"))
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    replay_csv = runtime_dir / "_r2_live_replay.csv"
+    replay_csv = runtime_dir / "_nifty_live_replay.csv"
     data.to_csv(replay_csv, index=False)
     strategy.init(replay_csv)
 
@@ -920,7 +918,7 @@ def live_phase(now: pd.Timestamp) -> str:
     if t < STRATEGY_START:
         return "PREOPEN_WARMUP"
     if t <= STRATEGY_LAST:
-        return "R2_SPOT_ACTIVE"
+        return "SPOT_STRATEGY_ACTIVE"
     if t < CAS_PROVISIONAL_FROM:
         return "CAS_WAIT"
     if t < CAS_FINAL_LOCK:
@@ -951,28 +949,43 @@ def today_latest_quote(df: pd.DataFrame, now: pd.Timestamp,
     return pd.Timestamp(r.timestamp), float(r.close)
 
 
+def _child_session_age(live_all: pd.DataFrame, child_date: str, today_key: str) -> int:
+    try:
+        a=pd.Timestamp(child_date).date(); b=pd.Timestamp(today_key).date()
+    except Exception:
+        return 1
+    days=sorted(set(live_all.timestamp.dt.date))
+    return max(1, sum(1 for d in days if a <= d <= b))
+
+
 def cas_management_message(t: LiveTrade, spot: float, pnl: float,
-                           provisional: bool, harvest_trigger: float,
-                           harvest_pct: int, runner_pct: int) -> str:
+                           provisional: bool, action: str, session_age: int,
+                           child_entry: float) -> str:
     pxlabel = "PROVISIONAL CAS" if provisional else "FINAL CAS"
-    if pnl >= harvest_trigger:
-        action = (
-            f"Action: HARVEST {harvest_pct}% of the ITM3 option position; "
-            f"leave {runner_pct}% runner while strategy parent remains open."
+    if action == "ROLL_PROFIT":
+        advice = (
+            "Action: +70 child threshold reached. Close the current ITM3 child "
+            "and buy a fresh ITM3 in the SAME direction; parent trend remains active."
+        )
+    elif action == "ROLL_AGE":
+        advice = (
+            "Action: two-session age boundary reached. Roll the full current ITM3 "
+            "into a fresh ITM3 in the SAME direction; parent trend remains active."
         )
     else:
-        action = (
-            "Action: no +70 harvest trigger. Keep management aligned with the "
-            "existing strategy open position until the 15:40 F&O close."
+        advice = (
+            "Action: HOLD current ITM3 child. No +70 profit roll and age boundary "
+            "has not been reached."
         )
     return (
         f"🟣 NIFTY LIVE CAS OPTION MANAGEMENT\n"
         f"{pxlabel} NIFTY: {spot:.2f}\n"
         f"Module: {t.module}\n"
         f"Direction: {t.direction}\n"
-        f"Spot entry: {t.entry_price:.2f}\n"
-        f"CAS-referenced spot P&L: {pnl:+.2f}\n"
-        f"{action}"
+        f"Current child spot reference: {child_entry:.2f}\n"
+        f"Child session age: {session_age}\n"
+        f"CAS-referenced child P&L: {pnl:+.2f}\n"
+        f"{advice}"
     )
 
 
@@ -1022,31 +1035,36 @@ def handle_cas_management(
         state["cas_final_date"] = today_key
 
     harvest_trigger = float(os.getenv("NIFTY_CAS_HARVEST_TRIGGER", "70"))
-    harvest_pct = int(os.getenv("NIFTY_CAS_HARVEST_PERCENT", "80"))
-    runner_pct = int(os.getenv("NIFTY_CAS_RUNNER_PERCENT", "20"))
     mgmt_seen = state.setdefault("cas_management_notices", [])
+    children = state.setdefault("itm3_children", {})
 
     for tr in [x for x in trades if x.status == "OPEN"]:
+        ek=tr.entry_key()
+        child=children.get(ek)
+        if child is None:
+            child={"entry_price":float(tr.entry_price),"entry_date":str(tr.entry_time.date())}
+            children[ek]=child
+        child_entry=float(child.get("entry_price",tr.entry_price))
+        child_date=str(child.get("entry_date",tr.entry_time.date()))
+        age=_child_session_age(live_all,child_date,today_key)
         d = 1 if tr.direction == "LONG" else -1
-        pnl = d * (float(qspot) - tr.entry_price)
-        action = "HARVEST" if pnl >= harvest_trigger else "HOLD"
-        key = f"{today_key}:{phase_key}:{tr.entry_key()}:{action}"
+        pnl = d * (float(qspot) - child_entry)
+        action = "ROLL_PROFIT" if pnl >= harvest_trigger else ("ROLL_AGE" if age >= 2 else "HOLD")
+        key = f"{today_key}:{phase_key}:{ek}:{action}:{child_date}"
         if key in mgmt_seen:
             continue
-        telegram_send(
-            cas_management_message(
-                tr, qspot, pnl, provisional,
-                harvest_trigger, harvest_pct, runner_pct
-            )
-        )
+        telegram_send(cas_management_message(tr,qspot,pnl,provisional,action,age,child_entry))
         log_cas(
             cas_log, now, f"OPTION_{action}", qspot, qtime,
-            f"{tr.module} {tr.direction} entry={tr.entry_price:.2f} "
-            f"spot_pnl={pnl:+.2f}"
+            f"{tr.module} {tr.direction} child_entry={child_entry:.2f} "
+            f"child_age={age} child_pnl={pnl:+.2f}"
         )
-        bounded_add(mgmt_seen, key, 2000)
+        bounded_add(mgmt_seen,key,3000)
+        # Only the final/locked CAS reference changes the live child state.
+        if (not provisional) and action in ("ROLL_PROFIT","ROLL_AGE"):
+            children[ek]={"entry_price":float(qspot),"entry_date":today_key,
+                          "rolled_at":str(qtime),"roll_reason":action}
 
-    # One final management-close notice at/after 15:40.
     if tnow >= FNO_CLOSE and state.get("fno_close_notice_date") != today_key:
         opens = [x for x in trades if x.status == "OPEN"]
         telegram_send(
@@ -1055,10 +1073,8 @@ def handle_cas_management(
             f"Open strategy positions: {len(opens)}\n"
             f"No new strategy spot signal will be created after 15:15."
         )
-        log_cas(
-            cas_log, now, "FNO_CLOSE_1540", qspot, qtime,
-            f"Open strategy positions={len(opens)}"
-        )
+        log_cas(cas_log,now,"FNO_CLOSE_1540",qspot,qtime,
+                f"Open strategy positions={len(opens)}")
         state["fno_close_notice_date"] = today_key
 
 
@@ -1350,7 +1366,7 @@ def write_live_excel_report(
         ("After 15:15","Freeze new spot-strategy entries."),
         ("15:15-15:29","CAS observation / option-management preparation."),
         ("15:29-15:35","CAS price treated as provisional and updated when provider changes."),
-        ("15:35-15:40","Final CAS reference locked; option-management only."),
+        ("15:35-15:40","Final CAS reference locked; +70/age-based ITM3 rolling only."),
         ("Risk","Initial paid stop is 10 NIFTY spot points."),
     ]
     for r,row in enumerate(rule_rows,start=1):
@@ -1375,7 +1391,7 @@ def run_once(args) -> int:
     cas_log = Path(args.cas_log)
     report_path = Path(args.excel_report)
 
-    strategy, engine_sha = load_r2_engine(engine_path)
+    strategy, engine_sha = load_strategy_engine(engine_path)
 
     # LIVE ONLY: no static historical NIFTY file is loaded here.
     cache = load_any(cache_path) if cache_path.exists() else pd.DataFrame(

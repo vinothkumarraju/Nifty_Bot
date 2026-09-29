@@ -1,0 +1,137 @@
+name: NIFTY Live Engine
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub cron is UTC. This broad 5-minute schedule is gated below in IST.
+    # 09:00 IST = 03:30 UTC
+    # 15:40 IST = 10:10 UTC
+    - cron: "*/5 3-10 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nifty-live-engine
+  cancel-in-progress: false
+
+jobs:
+  nifty-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      TZ: Asia/Kolkata
+
+      # Stable filenames: replace these files when a new research version is promoted.
+      NIFTY_ENGINE_PATH: NIFTY_RULES_ONLY_ENGINE.py
+      NIFTY_PROVIDER: yahoo
+
+      NIFTY_STATE_PATH: runtime/nifty_live_state.json
+      NIFTY_LIVE_CACHE: runtime/nifty_live_minutes.csv
+      NIFTY_RUNTIME_DIR: runtime
+
+      NIFTY_EVENT_LOG: logs/nifty_trade_events.csv
+      NIFTY_STATUS_LOG: logs/nifty_status_30m.csv
+      NIFTY_CAS_LOG: logs/nifty_cas_management.csv
+      NIFTY_ERROR_LOG: logs/nifty_errors.csv
+
+      NIFTY_EXCEL_REPORT: reports/NIFTY_LIVE_Trade_Report.xlsx
+
+      NIFTY_ALERT_LOOKBACK_MIN: "15"
+      NIFTY_STATUS_MINUTES: "30"
+
+      # CAS/F&O live management defaults.
+      NIFTY_CAS_HARVEST_TRIGGER: "70"
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Gate to 09:00-15:40 IST
+        id: market_window
+        shell: bash
+        run: |
+          NOW_IST="$(TZ=Asia/Kolkata date +'%H%M')"
+          DOW="$(TZ=Asia/Kolkata date +'%u')"
+          echo "Current IST: $(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M:%S %Z')"
+
+          RUN=false
+          if [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ] && \
+             [ "$NOW_IST" -ge 0900 ] && [ "$NOW_IST" -le 1540 ]; then
+            RUN=true
+          fi
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.market_window.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.market_window.outputs.run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas requests yfinance xlsxwriter
+
+      - name: Verify stable GitHub files
+        if: steps.market_window.outputs.run == 'true'
+        shell: bash
+        run: |
+          test -f NIFTY_RULES_ONLY_ENGINE.py
+          test -f NIFTY_LIVE_ENGINE.py
+
+      - name: Run live engine
+        if: steps.market_window.outputs.run == 'true'
+        run: |
+          python NIFTY_LIVE_ENGINE.py \
+            --engine "$NIFTY_ENGINE_PATH" \
+            --provider "$NIFTY_PROVIDER" \
+            --state "$NIFTY_STATE_PATH" \
+            --cache "$NIFTY_LIVE_CACHE" \
+            --event-log "$NIFTY_EVENT_LOG" \
+            --status-log "$NIFTY_STATUS_LOG" \
+            --cas-log "$NIFTY_CAS_LOG" \
+            --error-log "$NIFTY_ERROR_LOG" \
+            --excel-report "$NIFTY_EXCEL_REPORT" \
+            --alert-lookback-min "$NIFTY_ALERT_LOOKBACK_MIN" \
+            --status-minutes "$NIFTY_STATUS_MINUTES"
+
+      - name: Persist live cache, logs and Excel report
+        if: steps.market_window.outputs.run == 'true' && always()
+        shell: bash
+        run: |
+          git config user.name "nifty-live-bot"
+          git config user.email "nifty-live-bot@users.noreply.github.com"
+
+          mkdir -p runtime logs reports
+
+          git add runtime/ logs/ reports/ || true
+
+          if git diff --cached --quiet; then
+            echo "No live-state changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update NIFTY live state [skip ci]"
+
+          # Scheduled runs can occasionally overlap with a just-finished push.
+          # Rebase once before pushing the persisted state.
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      - name: Show latest live state
+        if: steps.market_window.outputs.run == 'true' && always()
+        shell: bash
+        run: |
+          if [ -f "$NIFTY_STATE_PATH" ]; then
+            cat "$NIFTY_STATE_PATH"
+          fi

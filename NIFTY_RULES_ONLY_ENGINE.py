@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
 NIFTY RULES-ONLY TREND ENGINE
+====================================
 
-Standalone live-causal engine. Input is raw NIFTY 1-minute OHLC only.
-The file contains strategy rules/parameters and calculation code only.
-It contains no historical trade rows, timestamps, ledgers, P&L records,
-encoded datasets, date-specific fixes, costs, or forced-result constants.
+Standalone, live-causal strategy engine.
 
-Strategy structure:
-raw 1m -> parent campaign -> swing proof/pullback/reclaim -> two sequential
-weekly-state intraday reclaim modules -> generated trades and metrics.
+Input: raw NIFTY 1-minute OHLC CSV/ZIP only.
+Output: signals/trades generated sequentially from rules in this file.
 
-Every paid initial stop is 10 NIFTY points. Decisions use completed bars;
-entries occur at the next available 1-minute open. Protective break-even or
-profit-lock movement is allowed only after a trade has moved favorably.
+Integrity standard:
+- no historical trade rows or timestamps embedded;
+- no historical P&L ledger or precomputed signal table;
+- no base64/gzip/encoded historical trades;
+- no result-forcing checksum or target P&L constant;
+- decisions use completed bars and next valid 1-minute fills;
+- every paid initial stop is at least 10 NIFTY points;
+- Current strategy adds selective ITM3 time-risk protection and a generated two-session
+  ITM3 execution-roll plan while preserving the parent NIFTY campaign.
 
---start and --end select the replay window; --end is exclusive.
+Historical data is used only when supplied at runtime as the raw 1-minute input.
 """
 import pandas as pd, numpy as np, itertools, json, math, time, zipfile
 from multiprocessing import Pool, cpu_count
@@ -145,11 +148,11 @@ def sim(p,frames=False):
                         if r3d<p.get('d_ret3min',-1e9): continue
                     entrybar=q;delayed=True;dtype='bear_delayed';break
             elif p.get('ub_on',False) or p.get('ubk_on',False) or p.get('ubw_on',False) or p.get('ubr2_on',False):
-                # LIVE-CAUSAL competition between the existing V5 delayed-BULL
+                # LIVE-CAUSAL competition between the existing primary route delayed-BULL
                 # module and the optional rejected-BULL breakout fallback.
-                # At each completed 30m bar, V5 gets first priority; if it does
+                # At each completed 30m bar, the primary continuation route gets first priority; if it does
                 # not trigger on THAT BAR, the breakout rule may trigger on the
-                # same completed bar. We never look ahead to see whether V5
+                # same completed bar. We never look ahead to see whether primary route
                 # would trigger on a later bar before allowing the fallback.
                 starts=[]
                 if p.get('ub_on',False): starts.append(bi+int(p['ub_minbars']))
@@ -161,7 +164,7 @@ def sim(p,frames=False):
                 q0=max(bi+1, min(starts)) if starts else bn
                 ubr2_armed=False
                 for q in range(q0,bn):
-                    # Existing V5 delayed-BULL rule, evaluated first on q.
+                    # Existing primary route delayed-BULL rule, evaluated first on q.
                     if p.get('ub_on',False) and q>=bi+int(p['ub_minbars']):
                         pass_ub=True
                         if not ef[q]>es[q] or gap[q]<p['ub_absgap']: pass_ub=False
@@ -178,7 +181,7 @@ def sim(p,frames=False):
                         if pass_ub:
                             entrybar=q;delayed=True;dtype='bull_delayed';break
 
-                    # Optional causal breakout fallback, evaluated only if V5
+                    # Optional causal breakout fallback, evaluated only if primary route
                     # did not trigger on this same completed bar. IMPORTANT: a
                     # failed breakout check must NOT skip later fallback modules.
                     if p.get('ubk_on',False) and q>=bi+int(p.get('ubk_minbars',5)):
@@ -727,24 +730,46 @@ def run_swing_collector(df, core, *, swing_k=.75, breakout_bars=4, stop_points=1
             if route=='MICROCHAIN' and ls not in (2,3):cursor=ri+1;continue
             if route=='PRIOR' and ls>max_prior_loss_streak:cursor=ri+1;continue
             ep=float(op[ri]);paid+=1;sl=ep-stop_points if d==1 else ep+stop_points
-            hit=np.flatnonzero((lo[ri:end]<=sl) if d==1 else (hi[ri:end]>=sl))
-            if len(hit):
-                xi=ri+int(hit[0]);xp=sl;pnl=-stop_points;cursor=xi+1;same_losses+=1
-                if same_losses>=2:blocked=signal_time
-                if route=='PRIOR':
-                    prior_fail+=1
-                    if prior_fail>=prior_loss_trigger:cool_left=prior_cooldown_swings
+            _hit=False; _xp=np.nan; _mfe=0.0; _protected=False
+            for kk in range(ri,end):
+                if d==1:
+                    if op[kk]<=sl: _hit=True; xi=kk; _xp=float(op[kk]); break
+                    if lo[kk]<=sl: _hit=True; xi=kk; _xp=float(sl); break
+                    _mfe=max(_mfe,float(hi[kk]-ep))
+                else:
+                    if op[kk]>=sl: _hit=True; xi=kk; _xp=float(op[kk]); break
+                    if hi[kk]>=sl: _hit=True; xi=kk; _xp=float(sl); break
+                    _mfe=max(_mfe,float(ep-lo[kk]))
+                # ITM3 time-risk protection: after 20 completed market minutes,
+                # a swing child that has already proven +40 MFE can no longer
+                # return to its original -10 risk. A +5 protective stop becomes
+                # active from the NEXT minute, avoiding same-bar hindsight.
+                # A universal 30-minute forced exit was deliberately rejected:
+                # the selective protection preserves the large parent runners.
+                if (not _protected) and (kk-ri+1)>=20 and _mfe>=40.0:
+                    sl=ep+5.0 if d==1 else ep-5.0; _protected=True
+            if _hit:
+                xp=float(_xp);pnl=float(d*(xp-ep));cursor=xi+1
+                if pnl<=0:
+                    same_losses+=1
+                    if same_losses>=2:blocked=signal_time
+                    if route=='PRIOR':
+                        prior_fail+=1
+                        if prior_fail>=prior_loss_trigger:cool_left=prior_cooldown_swings
+                else:
+                    same_losses=0;blocked=None
+                    if route=='PRIOR':prior_fail=0
             else:
                 xi=end;xp=float(op[xi]);pnl=d*(xp-ep);cursor=end;same_losses=0;blocked=None
                 if route=='PRIOR':prior_fail=0
             rows.append((entry_time,pd.Timestamp(times[xi]),d,ep,xp,float(pnl),route,ls,wk))
-            if not len(hit):break
+            if not _hit:break
     return pd.DataFrame(rows,columns=['Entry_Time','Exit_Time','d','Entry','Exit','Points','Route','Core_Loss_Streak','Week_Realized'])
 
 
 
 # -----------------------------------------------------------------------------
-# Strategy rule set: refined swing collector + sequential intraday week-repair rules.
+# Current promoted rule set: refined swing collector + sequential intraday week-repair rules.
 # All constants below are strategy parameters, never historical outcomes.
 # -----------------------------------------------------------------------------
 
@@ -935,9 +960,11 @@ def _strategy_repair_a_config():
 
 
 def _strategy_repair_b_config():
-    return dict(pi=1,ci=0,mi=1,pgn=.05,cgn=.60,mgn=.05,ratio=1.25,body=.30,er=.30,r3=20.0,
-                target=70.0,be_arm=40.0,be_lock=5.0,trail_arm=70.0,trail_dist=50.0,
-                maxtr=3,cool=30,startm=630,endm=900,weekgate=0.0,stopgreen=0.0)
+    # Weekly-repair plateau: balanced 30m/15m/5m alignment with a modest
+    # negative-week gate. Parameters are rules only and use current-run state.
+    return dict(pi=1,ci=0,mi=1,pgn=.05,cgn=.55,mgn=.05,ratio=1.10,body=.40,er=.40,r3=15.0,
+                target=70.0,be_arm=50.0,be_lock=10.0,trail_arm=100.0,trail_dist=40.0,
+                maxtr=2,cool=30,startm=615,endm=900,weekgate=-10.0,stopgreen=10.0)
 
 
 def _combine_generated(core, swing, repair_a, repair_b):
@@ -961,6 +988,84 @@ def _period_counts(df, realized):
                 weekly=dict(positive=int((wv>0).sum()),negative=int((wv<0).sum()),flat=int((wv==0).sum())))
 
 
+
+def _itm3_execution_segments(df, core, swing, *, profit_roll=70.0, max_sessions=2,
+                             roll_hour=15, roll_minute=15):
+    """Generate an option-execution roll plan from current-run rules only.
+
+    This does NOT alter the parent NIFTY strategy P&L. It converts long-lived
+    CORE/SWING parent exposure into short ITM3 execution children:
+      * at each 15:15 session boundary, harvest/roll if child spot profit >= +70;
+      * regardless of P&L, roll by the second trading session so the same
+        weekly ITM3 contract is not intentionally carried through a long trend;
+      * close and reopen at the same NIFTY reference, so child spot points
+        telescope exactly back to the parent spot points.
+
+    The parent trend remains alive after a roll. Actual strike/expiry selection
+    belongs to the live options execution layer.
+    """
+    times=df.timestamp.to_numpy(dtype='datetime64[ns]')
+    op=df.open.to_numpy(float)
+    dates=pd.to_datetime(df.timestamp).dt.normalize()
+    unique_days=list(pd.Index(dates.unique()).sort_values())
+    day_pos={pd.Timestamp(d).date():i for i,d in enumerate(unique_days)}
+    lookup={pd.Timestamp(ts):float(px) for ts,px in zip(df.timestamp,op)}
+
+    parents=[]
+    for r in core.itertuples(index=False):
+        d=1 if str(r.Direction)=='LONG' else -1
+        parents.append(dict(Parent_Module='CORE',Parent_ID=int(r.Parent_Regime_ID),Direction='LONG' if d==1 else 'SHORT',d=d,
+                            Entry_Time=pd.Timestamp(r.Entry_Time),Exit_Time=pd.Timestamp(r.Exit_Time),
+                            Entry_Price=float(r.NIFTY_Entry),Exit_Price=float(r.NIFTY_Exit)))
+    for j,r in enumerate(swing.itertuples(index=False),1):
+        d=int(r.d)
+        parents.append(dict(Parent_Module='SWING',Parent_ID=j,Direction='LONG' if d==1 else 'SHORT',d=d,
+                            Entry_Time=pd.Timestamp(r.Entry_Time),Exit_Time=pd.Timestamp(r.Exit_Time),
+                            Entry_Price=float(r.Entry),Exit_Price=float(r.Exit)))
+
+    out=[]
+    for p in parents:
+        e=p['Entry_Time']; x=p['Exit_Time']; d=p['d']
+        if e.date() not in day_pos or x.date() not in day_pos or x<=e:
+            continue
+        child_start=e; child_px=p['Entry_Price']; child_session0=day_pos[e.date()]; seg=1
+        end_day=day_pos[x.date()]
+        k=child_session0
+        while k<=end_day:
+            bd=pd.Timestamp(unique_days[k])+pd.Timedelta(hours=roll_hour,minutes=roll_minute)
+            if child_start < bd < x and bd in lookup:
+                px=float(lookup[bd]); pnl=float(d*(px-child_px)); age=int(k-child_session0+1)
+                reason=None
+                if pnl>=profit_roll: reason='PROFIT_ROLL_70'
+                elif age>=max_sessions: reason='AGE_ROLL_2D'
+                if reason is not None:
+                    out.append(dict(Parent_Module=p['Parent_Module'],Parent_ID=p['Parent_ID'],Segment_ID=seg,
+                                    Direction=p['Direction'],Entry_Time=child_start,Exit_Time=bd,
+                                    Entry_Price=float(child_px),Exit_Price=px,Spot_Points=pnl,
+                                    Exit_Reason=reason,Trading_Sessions=age))
+                    seg+=1;child_start=bd;child_px=px;child_session0=k
+            k+=1
+        age=max(1,end_day-child_session0+1)
+        out.append(dict(Parent_Module=p['Parent_Module'],Parent_ID=p['Parent_ID'],Segment_ID=seg,
+                        Direction=p['Direction'],Entry_Time=child_start,Exit_Time=x,
+                        Entry_Price=float(child_px),Exit_Price=float(p['Exit_Price']),
+                        Spot_Points=float(d*(p['Exit_Price']-child_px)),Exit_Reason='PARENT_EXIT',
+                        Trading_Sessions=int(age)))
+    return pd.DataFrame(out)
+
+
+def _loss_duration_diagnostics(frames):
+    rows=[]
+    for z in frames:
+        if z is None or len(z)==0: continue
+        q=z.copy();q['Entry_Time']=pd.to_datetime(q.Entry_Time);q['Exit_Time']=pd.to_datetime(q.Exit_Time)
+        q['Duration_Min']=(q.Exit_Time-q.Entry_Time).dt.total_seconds()/60.0
+        rows.append(q[['Points','Duration_Min']])
+    if not rows:return dict(losses=0,losses_over_30m=0,avg_loss_duration_min=0.0)
+    q=pd.concat(rows,ignore_index=True);loss=q.Points<0
+    return dict(losses=int(loss.sum()),losses_over_30m=int((loss&(q.Duration_Min>30)).sum()),
+                avg_loss_duration_min=float(q.loc[loss,'Duration_Min'].mean()) if loss.any() else 0.0)
+
 def run_engine(args):
     init(args.nifty)
     p=strategy_core_params(args.start,args.end)
@@ -976,6 +1081,7 @@ def run_engine(args):
     with_a=pd.concat([base,repair_a[['Entry_Time','Exit_Time','Points','Module']]],ignore_index=True)
     repair_b=_run_week_repair(sdf,with_a,feat,_strategy_repair_b_config(),'REPAIR_B')
     realized=_combine_generated(core,swing,repair_a,repair_b)
+    itm3_segments=_itm3_execution_segments(sdf,core,swing,profit_roll=70.0,max_sessions=2)
 
     cm=_closed_metrics(core.sort_values(['Exit_Time','Entry_Time']).Points)
     sm=_closed_metrics(swing.sort_values(['Exit_Time','Entry_Time']).Points)
@@ -988,8 +1094,17 @@ def run_engine(args):
         z=realized[yy==y]
         years.append({'year':int(y),'points':float(z.Points.sum()),'trades':int(len(z))})
     counts=_period_counts(sdf,realized)
+    risk_diag=_loss_duration_diagnostics([core[['Entry_Time','Exit_Time','Points']],
+                                          swing[['Entry_Time','Exit_Time','Points']],
+                                          repair_a[['Entry_Time','Exit_Time','Points']] if len(repair_a) else None,
+                                          repair_b[['Entry_Time','Exit_Time','Points']] if len(repair_b) else None])
+    roll_summary={'segments':int(len(itm3_segments)),'roll_boundaries':int((itm3_segments.Exit_Reason!='PARENT_EXIT').sum()) if len(itm3_segments) else 0,
+                  'profit_rolls':int((itm3_segments.Exit_Reason=='PROFIT_ROLL_70').sum()) if len(itm3_segments) else 0,
+                  'age_rolls':int((itm3_segments.Exit_Reason=='AGE_ROLL_2D').sum()) if len(itm3_segments) else 0,
+                  'max_child_sessions':int(itm3_segments.Trading_Sessions.max()) if len(itm3_segments) else 0}
     summary={'core':cm,'swing':sm,'repair_a':am,'repair_b':bm,'combined':fm,
-             'daily':counts['daily'],'weekly':counts['weekly'],'yearly':years}
+             'daily':counts['daily'],'weekly':counts['weekly'],'yearly':years,
+             'risk_duration':risk_diag,'itm3_execution_segments':roll_summary}
     print(json.dumps(summary,indent=2))
 
     if args.out:
@@ -1001,6 +1116,7 @@ def run_engine(args):
         repair_a.to_csv(out/'repair_a_generated.csv',index=False)
         repair_b.to_csv(out/'repair_b_generated.csv',index=False)
         realized.to_csv(out/'all_generated.csv',index=False)
+        itm3_segments.to_csv(out/'itm3_execution_segments_generated.csv',index=False)
         masters.to_csv(out/'core_masters_generated.csv',index=False)
         (out/'summary.json').write_text(json.dumps(summary,indent=2))
 
