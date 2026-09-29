@@ -43,8 +43,6 @@ jobs:
 
       # CAS/F&O live management defaults.
       NIFTY_CAS_HARVEST_TRIGGER: "70"
-      NIFTY_CAS_HARVEST_PERCENT: "80"
-      NIFTY_CAS_RUNNER_PERCENT: "20"
 
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
