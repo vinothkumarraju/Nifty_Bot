@@ -1,0 +1,133 @@
+name: R2 NIFTY Live Telegram
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub cron uses UTC.
+    # 03:30 UTC = 09:00 IST
+    # 10:10 UTC = 15:40 IST
+    #
+    # We schedule every 5 minutes across the surrounding UTC hours,
+    # then the IST gate below allows execution only from 09:00-15:40 IST.
+    - cron: "*/5 3-10 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: r2-nifty-live
+  cancel-in-progress: false
+
+jobs:
+  r2-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    env:
+      TZ: Asia/Kolkata
+
+      # Exact delivered R2 files expected in repository root.
+      R2_ENGINE_PATH: NIFTY_NEW_RULES_ONLY_ENGINE_R2.py
+      NIFTY_HISTORY_PATH: data/nifty_1min_2015_2026.csv.zip
+
+      # Live data source.
+      # For exact production parity, replace Yahoo with your continuous
+      # broker/data-feed CSV and set R2_PROVIDER=csv + R2_LIVE_CSV.
+      R2_PROVIDER: yahoo
+
+      # Persistent runtime files. The live runner commits these back to
+      # the repository so the next scheduled GitHub run remembers which
+      # Telegram alerts have already been sent and retains new 1m bars.
+      R2_STATE_PATH: runtime/r2_live_state.json
+      R2_LIVE_CACHE: runtime/nifty_live.csv
+      R2_RUNTIME_DIR: runtime
+      R2_PERSIST_GIT: "1"
+
+      # Runner settings.
+      R2_ALERT_LOOKBACK_MIN: "15"
+      R2_STATUS_MINUTES: "30"
+
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Gate to 09:00-15:40 IST
+        id: market_window
+        shell: bash
+        run: |
+          NOW_IST="$(TZ=Asia/Kolkata date +'%H%M')"
+          DOW="$(TZ=Asia/Kolkata date +'%u')"
+
+          echo "Current IST: $(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M:%S %Z')"
+
+          RUN=false
+          if [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ]; then
+            if [ "$NOW_IST" -ge 0900 ] && [ "$NOW_IST" -le 1540 ]; then
+              RUN=true
+            fi
+          fi
+
+          echo "run=$RUN" >> "$GITHUB_OUTPUT"
+
+          if [ "$RUN" != "true" ]; then
+            echo "Outside R2 live window (09:00-15:40 IST). Nothing to do."
+          fi
+
+      - name: Set up Python
+        if: steps.market_window.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.market_window.outputs.run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas requests yfinance
+
+      - name: Verify required R2 files
+        if: steps.market_window.outputs.run == 'true'
+        shell: bash
+        run: |
+          test -f "$R2_ENGINE_PATH" || {
+            echo "Missing $R2_ENGINE_PATH"
+            exit 1
+          }
+
+          test -f "R2_LIVE_GITHUB_TELEGRAM.py" || {
+            echo "Missing R2_LIVE_GITHUB_TELEGRAM.py"
+            exit 1
+          }
+
+          test -f "$NIFTY_HISTORY_PATH" || {
+            echo "Missing $NIFTY_HISTORY_PATH"
+            exit 1
+          }
+
+      - name: Run R2 live engine and Telegram alerts
+        if: steps.market_window.outputs.run == 'true'
+        run: |
+          python R2_LIVE_GITHUB_TELEGRAM.py \
+            --engine "$R2_ENGINE_PATH" \
+            --history "$NIFTY_HISTORY_PATH" \
+            --provider "$R2_PROVIDER" \
+            --state "$R2_STATE_PATH" \
+            --cache "$R2_LIVE_CACHE" \
+            --alert-lookback-min "$R2_ALERT_LOOKBACK_MIN" \
+            --status-minutes "$R2_STATUS_MINUTES"
+
+      - name: Show latest persisted state
+        if: steps.market_window.outputs.run == 'true' && always()
+        shell: bash
+        run: |
+          if [ -f "$R2_STATE_PATH" ]; then
+            echo "----- R2 state -----"
+            cat "$R2_STATE_PATH"
+          fi
