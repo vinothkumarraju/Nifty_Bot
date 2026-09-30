@@ -1,0 +1,174 @@
+{
+  "updated_at_ist": "2026-09-30T23:06:05.747339+05:30",
+  "phase": "closed",
+  "symbol": "^NSEI",
+  "source": "Yahoo Finance 1m + rolling repository cache",
+  "spot": {
+    "last_completed_1m": 22620.44921875,
+    "timestamp": "2026-09-30 15:29:00"
+  },
+  "parent_30m": {
+    "direction": "BEAR",
+    "ema19": 22709.325161685134,
+    "ema29": 22745.580617843905,
+    "gap": 36.25545615877127,
+    "last_completed_30m": "2026-09-30 15:14:00",
+    "cross": null
+  },
+  "live": {
+    "day_points": 25.0,
+    "week_points": 4.80078125,
+    "loss_streak": 1,
+    "sessions_in_cache": 7,
+    "warmup_ready": true,
+    "entry_cutoff_ist": "15:15",
+    "active_edge_rows": []
+  },
+  "engine_replay": {
+    "net": 128.55078125,
+    "pf": 2.3397793429141394,
+    "dd": 40.19921875,
+    "trades": 18,
+    "win_rate": 38.88888888888889
+  },
+  "checkpoint": {
+    "name": "R7-8 verified",
+    "period": "2020-01-01 to 2026-05-15",
+    "points": 41124.25,
+    "pf": 3.3902151959431044,
+    "dd": 261.45,
+    "trades": 2631,
+    "green_weeks": 217,
+    "red_weeks": 76,
+    "flat_weeks": 40
+  },
+  "recent_trades": [
+    {
+      "module": "CORE",
+      "direction": "SHORT",
+      "entry": "2026-09-22 10:45:00",
+      "exit": "2026-09-22 11:14:00",
+      "points": -10.0
+    },
+    {
+      "module": "C2145",
+      "direction": "SHORT",
+      "entry": "2026-09-22 11:40:00",
+      "exit": "2026-09-22 14:14:00",
+      "points": 25.0
+    },
+    {
+      "module": "R5_B",
+      "direction": "LONG",
+      "entry": "2026-09-23 10:00:00",
+      "exit": "2026-09-23 10:09:00",
+      "points": -10.0
+    },
+    {
+      "module": "R5_A",
+      "direction": "LONG",
+      "entry": "2026-09-23 10:20:00",
+      "exit": "2026-09-23 12:46:00",
+      "points": 50.0
+    },
+    {
+      "module": "C2145",
+      "direction": "LONG",
+      "entry": "2026-09-23 13:05:00",
+      "exit": "2026-09-23 13:11:00",
+      "points": -10.0
+    },
+    {
+      "module": "SWING",
+      "direction": "SHORT",
+      "entry": "2026-09-24 13:10:00",
+      "exit": "2026-09-25 10:15:00",
+      "points": 78.75
+    },
+    {
+      "module": "R7_4_STRONG_CHILD",
+      "direction": "SHORT",
+      "entry": "2026-09-28 09:40:00",
+      "exit": "2026-09-28 09:41:00",
+      "points": -10.0
+    },
+    {
+      "module": "R5_A",
+      "direction": "SHORT",
+      "entry": "2026-09-28 10:10:00",
+      "exit": "2026-09-28 10:11:00",
+      "points": -10.0
+    },
+    {
+      "module": "R5_B",
+      "direction": "SHORT",
+      "entry": "2026-09-28 10:20:00",
+      "exit": "2026-09-28 10:39:00",
+      "points": 20.0
+    },
+    {
+      "module": "R5_A",
+      "direction": "SHORT",
+      "entry": "2026-09-28 10:40:00",
+      "exit": "2026-09-28 10:58:00",
+      "points": -10.0
+    },
+    {
+      "module": "R5_B",
+      "direction": "SHORT",
+      "entry": "2026-09-28 11:05:00",
+      "exit": "2026-09-28 11:30:00",
+      "points": -5.94921875
+    },
+    {
+      "module": "REPAIR_A",
+      "direction": "SHORT",
+      "entry": "2026-09-28 13:05:00",
+      "exit": "2026-09-28 13:10:00",
+      "points": -10.0
+    },
+    {
+      "module": "REPAIR_B",
+      "direction": "SHORT",
+      "entry": "2026-09-28 14:20:00",
+      "exit": "2026-09-28 14:21:00",
+      "points": -10.0
+    },
+    {
+      "module": "R5_B",
+      "direction": "SHORT",
+      "entry": "2026-09-29 10:05:00",
+      "exit": "2026-09-29 10:10:00",
+      "points": 5.75
+    },
+    {
+      "module": "R5_A",
+      "direction": "SHORT",
+      "entry": "2026-09-29 10:10:00",
+      "exit": "2026-09-29 10:26:00",
+      "points": -10.0
+    },
+    {
+      "module": "R5_B",
+      "direction": "SHORT",
+      "entry": "2026-09-29 13:20:00",
+      "exit": "2026-09-29 13:28:00",
+      "points": 20.0
+    },
+    {
+      "module": "R5_A",
+      "direction": "LONG",
+      "entry": "2026-09-30 10:00:00",
+      "exit": "2026-09-30 10:30:00",
+      "points": 25.0
+    },
+    {
+      "module": "REPAIR_A",
+      "direction": "SHORT",
+      "entry": "2026-09-30 14:30:00",
+      "exit": "2026-09-30 14:48:00",
+      "points": -0.0
+    }
+  ],
+  "error": null
+}
