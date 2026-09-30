@@ -143,6 +143,18 @@ jobs:
         run: |
           python -m py_compile "$NIFTY_ENGINE_PATH" "$NIFTY_LIVE_RUNNER_PATH"
 
+      - name: Verify continuous live-runner interface
+        if: steps.market_window.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          HELP_TEXT="$(python "$NIFTY_LIVE_RUNNER_PATH" --help)"
+          echo "$HELP_TEXT"
+          grep -q -- "--continuous" <<< "$HELP_TEXT" || { echo "::error::Old NIFTY_LIVE_ENGINE.py: --continuous is missing. Replace the repo file with the current fixed runner."; exit 1; }
+          grep -q -- "--poll-seconds" <<< "$HELP_TEXT" || { echo "::error::Old NIFTY_LIVE_ENGINE.py: --poll-seconds is missing."; exit 1; }
+          grep -q -- "--until" <<< "$HELP_TEXT" || { echo "::error::Old NIFTY_LIVE_ENGINE.py: --until is missing."; exit 1; }
+          echo "Continuous live-runner interface: PASS"
+
       - name: Choose continuous live segment end
         id: segment
         if: steps.market_window.outputs.run == 'true'
