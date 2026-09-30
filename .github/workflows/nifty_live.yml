@@ -3,18 +3,12 @@ name: NIFTY Live Engine
 on:
   workflow_dispatch:
   schedule:
-    # GitHub Actions cron is UTC. Times below are India Standard Time (UTC+5:30).
-    # 09:00 IST boot
-    - cron: "30 3 * * 1-5"
-    # 09:10 IST pre-session NIFTY spot report
-    - cron: "40 3 * * 1-5"
-    # 09:15 IST strategy-session start + first status
-    - cron: "45 3 * * 1-5"
-    # Every 30 minutes thereafter: 09:45, 10:15, ... , 15:15 IST
-    - cron: "15,45 4-9 * * 1-5"
-    # CAS / closing-management checkpoints: 15:29, 15:35, 15:40 IST
-    - cron: "59 9 * * 1-5"
-    - cron: "5,10 10 * * 1-5"
+    # Two long-lived live segments. Once started, each segment polls every minute.
+    # GitHub schedules may be delayed; 11:57 is intentionally ahead of the midday handoff.
+    - cron: "0 9 * * 1-5"
+      timezone: "Asia/Kolkata"
+    - cron: "57 11 * * 1-5"
+      timezone: "Asia/Kolkata"
 
 permissions:
   contents: write
@@ -26,7 +20,7 @@ concurrency:
 jobs:
   nifty-live:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 240
 
     env:
       TZ: Asia/Kolkata
@@ -60,6 +54,8 @@ jobs:
       # Event detection + Telegram cadence.
       NIFTY_ALERT_LOOKBACK_MIN: "45"
       NIFTY_STATUS_MINUTES: "30"
+      # Immediate-event mode: keep live job hot and poll every completed minute.
+      NIFTY_POLL_SECONDS: "60"
 
       # CAS/F&O live-management default.
       NIFTY_CAS_HARVEST_TRIGGER: "70"
@@ -147,7 +143,23 @@ jobs:
         run: |
           python -m py_compile "$NIFTY_ENGINE_PATH" "$NIFTY_LIVE_RUNNER_PATH"
 
-      - name: Run NIFTY live engine and Telegram alerts
+      - name: Choose continuous live segment end
+        id: segment
+        if: steps.market_window.outputs.run == 'true'
+        shell: bash
+        run: |
+          NOW_IST="$(TZ=Asia/Kolkata date +'%H%M')"
+          # Morning job stays alive through 12:15. The 11:57 trigger queues behind it
+          # because concurrency is serialized, then continues the afternoon to 15:41.
+          if [ "$NOW_IST" -lt 1215 ]; then
+            STOP_TIME="12:15"
+          else
+            STOP_TIME="15:41"
+          fi
+          echo "stop_time=$STOP_TIME" >> "$GITHUB_OUTPUT"
+          echo "Continuous NIFTY live segment will run until $STOP_TIME IST"
+
+      - name: Run continuous NIFTY live engine and immediate Telegram alerts
         if: steps.market_window.outputs.run == 'true'
         run: |
           python "$NIFTY_LIVE_RUNNER_PATH" \
@@ -161,7 +173,10 @@ jobs:
             --error-log "$NIFTY_ERROR_LOG" \
             --excel-report "$NIFTY_EXCEL_REPORT" \
             --alert-lookback-min "$NIFTY_ALERT_LOOKBACK_MIN" \
-            --status-minutes "$NIFTY_STATUS_MINUTES"
+            --status-minutes "$NIFTY_STATUS_MINUTES" \
+            --continuous \
+            --poll-seconds "$NIFTY_POLL_SECONDS" \
+            --until "${{ steps.segment.outputs.stop_time }}"
 
       - name: Persist live cache, state, logs and Excel report
         if: steps.market_window.outputs.run == 'true' && always()
