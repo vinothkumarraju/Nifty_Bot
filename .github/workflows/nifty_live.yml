@@ -77,7 +77,7 @@ jobs:
       - name: Validate required engine files
         shell: bash
         run: |
-          test -f NIFTY_R7_RULES_ONLY_ENGINE.py || { echo "ERROR: NIFTY_R7_RULES_ONLY_ENGINE.py missing"; exit 1; }
+          test -f NIFTY_R7_RULES_ONLY_ENGINE.py || { echo "ERROR: NIFTY_RULES_ONLY_ENGINE.py missing"; exit 1; }
           test -f NIFTY_LIVE_ENGINE.py || { echo "ERROR: NIFTY_LIVE_ENGINE.py missing"; exit 1; }
           echo "Required R7 files found."
 
