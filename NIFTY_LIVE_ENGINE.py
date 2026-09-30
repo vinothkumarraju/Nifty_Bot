@@ -7,7 +7,7 @@ Purpose
 -------
 - Pull recent NIFTY spot 1-minute data from Yahoo Finance (^NSEI).
 - Keep a rolling raw-minute cache in the repository.
-- Replay the exact local NIFTY_R7_RULES_ONLY_ENGINE.py using ONLY data known so far.
+- Replay the exact local NIFTY_RULES_ONLY_ENGINE.py using ONLY data known so far.
 - Send immediate Telegram alerts for newly generated entries/exits.
 - Send a 30-minute heartbeat/status during the trading session.
 - 09:00 IST scheduler-alive message.
@@ -19,7 +19,7 @@ Purpose
 The live runner does NOT contain historical trades, P&L ledgers, date-specific
 winning trades, or forced results. The persisted JSON state is only for alert
 deduplication and the static viewer; strategy decisions are regenerated from
-raw OHLC by NIFTY_R7_RULES_ONLY_ENGINE.py on each run.
+raw OHLC by NIFTY_RULES_ONLY_ENGINE.py on each run.
 
 GitHub Secrets expected:
     TELEGRAM_BOT_TOKEN
@@ -27,7 +27,7 @@ GitHub Secrets expected:
 
 Optional environment variables:
     NIFTY_SYMBOL=^NSEI
-    R7_ENGINE=NIFTY_R7_RULES_ONLY_ENGINE.py
+    NIFTY_ENGINE=NIFTY_RULES_ONLY_ENGINE.py
     LIVE_CACHE=live_cache.csv
     LIVE_STATE=live_state.json
     LIVE_STATUS=live_status.json
@@ -56,7 +56,7 @@ import requests
 
 IST = "Asia/Kolkata"
 SYMBOL = os.getenv("NIFTY_SYMBOL", "^NSEI")
-ENGINE_FILE = Path(os.getenv("R7_ENGINE", "NIFTY_R7_RULES_ONLY_ENGINE.py"))
+ENGINE_FILE = Path(os.getenv("NIFTY_ENGINE", "NIFTY_RULES_ONLY_ENGINE.py"))
 CACHE_FILE = Path(os.getenv("LIVE_CACHE", "live_cache.csv"))
 STATE_FILE = Path(os.getenv("LIVE_STATE", "live_state.json"))
 STATUS_FILE = Path(os.getenv("LIVE_STATUS", "live_status.json"))
