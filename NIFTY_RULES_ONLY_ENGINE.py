@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NIFTY NEW RULES-ONLY TREND ENGINE R4
+NIFTY RULES-ONLY TREND ENGINE R7
 ====================================
 
 Standalone, live-causal strategy engine.
@@ -20,6 +20,11 @@ Integrity standard:
   and remains weak, exit only at the NEXT 1-minute open. No future data is used.
 
 Historical data is used only when supplied at runtime as the raw 1-minute input.
+
+R6 accepted rule:
+- Preserve the verified R5 A/B/C2145 architecture.
+- R5-B may not initiate a new paid entry from 11:30 through 12:59 session time.
+  Existing open trades and opposite-break exit signals remain unchanged.
 """
 import pandas as pd, numpy as np, itertools, json, math, time, zipfile
 from multiprocessing import Pool, cpu_count
@@ -1095,6 +1100,835 @@ _strategy_repair_a_config = _r3_repair_a_config
 _strategy_repair_b_config = _r3_repair_b_config
 
 
+
+# =============================================================================
+# R5 COMPLEMENTARY WATCHDOG LAYERS (A -> B -> C2145)
+# =============================================================================
+# All rules below are computed sequentially from the supplied raw 1-minute OHLC.
+# No historical trade rows, timestamps, P&L ledgers, or date-specific exceptions
+# are embedded. These layers are allowed to act only when earlier-priority
+# positions are flat. Completed 5m/15m bars decide; fills occur on the next
+# regular-session 1m open.
+
+R6_RULES = {
+    'A': {
+        'lookback_5m':4, 'day_move_min':40.0, 'efficiency_min':0.60,
+        'prev_close_buffer':0.0, 'families':('rolling_breakout','ema_pullback_reclaim','prior_15m_breakout'),
+        'protect_be_at_mfe':20.0, 'protect_25_at_mfe':45.0, 'protect_50_at_mfe':70.0,
+        'shadow_proof_after_nonpositive':20.0, 'max_paid_per_day':4,
+        'day_gate_below':10.0, 'week_gate_below':10.0, 'day_loss_floor':-20.0,
+        'initial_stop':10.0,
+    },
+    'B': {
+        'lookback_5m':3, 'day_move_min':0.0, 'efficiency_min':0.30,
+        'prev_close_buffer':0.0, 'families':('rolling_breakout','ema_pullback_reclaim','opening_range_breakout','prior_15m_breakout'),
+        'target':20.0, 'shadow_proof_after_nonpositive':20.0, 'max_paid_per_day':2,
+        'day_gate_below':1.0, 'week_gate_below':1.0, 'day_loss_floor':-20.0,
+        'initial_stop':10.0,
+    },
+    'C2145': {
+        'ema_fast_15m':21, 'ema_slow_15m':45, 'cross_shadow_proof':25.0,
+        'fresh_5m_breakout_lookback':4, 'protect_be_at_mfe':40.0,
+        'protect_25_at_mfe':70.0, 'max_trading_days':2, 'max_rolls':1,
+        'initial_stop':10.0,
+    },
+}
+
+
+def _r5_session_features(sdf, base_trades):
+    x=sdf[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    O=x.open.to_numpy(float); H=x.high.to_numpy(float); L=x.low.to_numpy(float); C=x.close.to_numpy(float)
+    T=x.timestamp.to_numpy(dtype='datetime64[ns]'); N=len(x)
+    D=pd.factorize(x.timestamp.dt.date)[0].astype(np.int32)
+    years=x.timestamp.dt.year.to_numpy(np.int16)
+    dates=np.array(x.timestamp.dt.date)
+    starts=np.r_[0,np.flatnonzero(D[1:]!=D[:-1])+1].astype(np.int64)
+    ends=np.r_[starts[1:]-1,N-1].astype(np.int64)
+    nd=len(starts); udates=np.array([dates[s] for s in starts],object)
+    prevclose=np.full(nd,np.nan)
+    if nd>1: prevclose[1:]=C[ends[:-1]]
+    wkdate=np.array([pd.Timestamp(d)-pd.Timedelta(days=pd.Timestamp(d).weekday()) for d in udates])
+    uw=np.unique(wkdate); WDAY=np.searchsorted(uw,wkdate).astype(np.int32); W=WDAY[D]; nw=len(uw)
+
+    # Earlier-priority (R4) occupancy and live realized day/week state.
+    diff=np.zeros(N+1,np.int32); base_start=np.zeros(N,np.int8)
+    add_day=np.zeros(N,float); add_week=np.zeros(N,float)
+    day_real=np.zeros(nd,float); week_real=np.zeros(nw,float)
+    bt=base_trades.copy()
+    bt['Entry_Time']=pd.to_datetime(bt.Entry_Time); bt['Exit_Time']=pd.to_datetime(bt.Exit_Time)
+    for r in bt.itertuples(index=False):
+        s=int(np.searchsorted(T,np.datetime64(r.Entry_Time),'left'))
+        e=int(np.searchsorted(T,np.datetime64(r.Exit_Time),'left'))
+        if 0<=s<N:
+            diff[s]+=1; base_start[s]=1
+        if 0<=e<N:
+            if e+1<=N: diff[e+1]-=1
+            day_real[D[e]]+=float(r.Points); week_real[W[e]]+=float(r.Points)
+            if e+1<N:
+                if D[e+1]==D[e]: add_day[e+1]+=float(r.Points)
+                if W[e+1]==W[e]: add_week[e+1]+=float(r.Points)
+    occ=(np.cumsum(diff[:-1])>0).astype(np.int8)
+    live_day=np.zeros(N,float); live_week=np.zeros(N,float)
+    for s,e in zip(starts,ends): live_day[s:e+1]=np.cumsum(add_day[s:e+1])
+    for wi in range(nw):
+        ix=np.flatnonzero(W==wi)
+        if len(ix): live_week[ix]=np.cumsum(add_week[ix])
+
+    # Completed 5-minute bars.
+    q=x.copy(); mm=q.timestamp.dt.hour*60+q.timestamp.dt.minute
+    q['day']=q.timestamp.dt.normalize(); q['bucket']=((mm-555)//5).astype(np.int16); q['idx']=np.arange(N)
+    b=q.groupby(['day','bucket'],sort=False).agg(last_idx=('idx','last'),bar_end=('timestamp','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),n=('idx','size')).reset_index(drop=True)
+    li=b.last_idx.to_numpy(np.int64); bo=b.open.to_numpy(float); bh=b.high.to_numpy(float); bl=b.low.to_numpy(float); bc=b.close.to_numpy(float); bn=b.n.to_numpy(np.int16)
+    NB=len(b); bD=pd.factorize(b.bar_end.dt.date)[0].astype(np.int32); bm=(b.bar_end.dt.hour*60+b.bar_end.dt.minute).to_numpy(np.int16)
+    bs=np.r_[0,np.flatnonzero(bD[1:]!=bD[:-1])+1].astype(np.int64); be=np.r_[bs[1:]-1,NB-1].astype(np.int64)
+    e5=ema(bc,5); e10=ema(bc,10)
+
+    # Completed 15-minute bars and EMA5/10 alignment used by A/B.
+    qq=x.copy(); m=qq.timestamp.dt.hour*60+qq.timestamp.dt.minute
+    qq['day']=qq.timestamp.dt.normalize(); qq['bucket']=((m-555)//15).astype(np.int16); qq['idx']=np.arange(N)
+    b15=qq.groupby(['day','bucket'],sort=False).agg(last_idx=('idx','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),n=('idx','size')).reset_index(drop=True)
+    l15=b15.last_idx.to_numpy(np.int64); h15=b15.high.to_numpy(float); lo15=b15.low.to_numpy(float); c15=b15.close.to_numpy(float)
+    e155=ema(c15,5); e1510=ema(c15,10)
+    mp=np.searchsorted(l15,li,side='right')-1
+    m15e5=np.where(mp>=0,e155[np.maximum(mp,0)],np.nan); m15e10=np.where(mp>=0,e1510[np.maximum(mp,0)],np.nan)
+    m15h=np.where(mp>0,h15[np.maximum(mp-1,0)],np.nan); m15l=np.where(mp>0,lo15[np.maximum(mp-1,0)],np.nan)
+
+    pc=np.full(NB,np.nan); dmove=np.zeros(NB); eff=np.zeros(NB); orh=np.full(NB,np.nan); orl=np.full(NB,np.nan)
+    for d,(s,e) in enumerate(zip(bs,be)):
+        pc[s:e+1]=prevclose[d]
+        hi=np.maximum.accumulate(bh[s:e+1]); lo=np.minimum.accumulate(bl[s:e+1])
+        dmove[s:e+1]=bc[s:e+1]-bo[s]
+        rg=hi-lo; eff[s:e+1]=np.divide(np.abs(dmove[s:e+1]),rg,out=np.zeros_like(rg),where=rg>0)
+        oe=min(e,s+5); orh[s:e+1]=np.max(bh[s:oe+1]); orl[s:e+1]=np.min(bl[s:oe+1])
+    rng=bh-bl; body=np.divide(bc-bo,rng,out=np.zeros_like(rng),where=rng>0)
+    prevc=np.r_[np.nan,bc[:-1]]; prevh=np.r_[np.nan,bh[:-1]]; prevl=np.r_[np.nan,bl[:-1]]
+    preve10=np.r_[np.nan,e10[:-1]]
+    roll={}
+    for n in (3,4,5):
+        rh=np.full(NB,np.nan); rl=np.full(NB,np.nan)
+        for s,e in zip(bs,be):
+            for i in range(s+n,e+1):
+                rh[i]=np.max(bh[i-n:i]); rl[i]=np.min(bl[i-n:i])
+        roll[n]=(rh,rl)
+    nxt=li+1; same=(nxt<N)
+    valid_n=np.flatnonzero(same)
+    same[valid_n]=D[nxt[valid_n]]==bD[valid_n]
+
+    return dict(x=x,O=O,H=H,L=L,C=C,T=T,N=N,D=D,W=W,years=years,starts=starts,ends=ends,nd=nd,nw=nw,
+                occ=occ,start=base_start,live_day=live_day,live_week=live_week,day_real=day_real,week_real=week_real,
+                b=b,li=li,bo=bo,bh=bh,bl=bl,bc=bc,bn=bn,NB=NB,bD=bD,bm=bm,bs=bs,be=be,e5=e5,e10=e10,
+                b15=b15,l15=l15,h15=h15,lo15=lo15,c15=c15,m15e5=m15e5,m15e10=m15e10,m15h=m15h,m15l=m15l,
+                pc=pc,dmove=dmove,eff=eff,orh=orh,orl=orl,body=body,prevc=prevc,prevh=prevh,prevl=prevl,preve10=preve10,
+                roll=roll,nxt=nxt,same=same)
+
+
+def _r5_build_signal(F,n,move,min_eff,buf,fammask,bodymin=.05,start_min=580,end_min=915):
+    rh,rl=F['roll'][n]; bc=F['bc']; pc=F['pc']; dmove=F['dmove']; eff=F['eff']; e5=F['e5']; e10=F['e10']
+    valid=(F['bn']>=5)&(F['bm']>=start_min)&(F['bm']<=end_min)&np.isfinite(pc)&F['same']
+    trendL=(bc>pc+buf)&(dmove>=move)&(eff>=min_eff)&(e5>e10)&(F['m15e5']>F['m15e10'])
+    trendS=(bc<pc-buf)&(dmove<=-move)&(eff>=min_eff)&(e5<e10)&(F['m15e5']<F['m15e10'])
+    Lsig=np.zeros(F['NB'],bool); Ssig=np.zeros(F['NB'],bool)
+    if fammask&1:
+        Lsig|=(bc>rh)&(F['prevc']<=rh); Ssig|=(bc<rl)&(F['prevc']>=rl)
+    if fammask&2:
+        pbL=(F['prevl']<=F['preve10'])&(bc>F['prevh'])&(bc>e5)&(F['body']>=bodymin)
+        pbS=(F['prevh']>=F['preve10'])&(bc<F['prevl'])&(bc<e5)&(F['body']<=-bodymin)
+        Lsig|=pbL; Ssig|=pbS
+    if fammask&4:
+        Lsig|=(bc>F['orh'])&(F['prevc']<=F['orh']); Ssig|=(bc<F['orl'])&(F['prevc']>=F['orl'])
+    if fammask&8:
+        Lsig|=(bc>F['m15h'])&(F['prevc']<=F['m15h']); Ssig|=(bc<F['m15l'])&(F['prevc']>=F['m15l'])
+    L=valid&trendL&Lsig; S=valid&trendS&Ssig
+    eL=np.zeros(F['N'],np.int8); eS=np.zeros(F['N'],np.int8); rL=np.zeros(F['N'],np.int8); rS=np.zeros(F['N'],np.int8)
+    eL[F['nxt'][L]]=1; eS[F['nxt'][S]]=1
+    rL[F['nxt'][valid&(bc>rh)]]=1; rS[F['nxt'][valid&(bc<rl)]]=1
+    return eL,eS,rL,rS
+
+
+def _r5_sim_breakout(F,eL,eS,rL,rS,occ,start_arr,baseDay,baseWeek,arm0,arm25,arm50,proof,maxpaid,target,day_gate,week_gate,max_day_loss,layer):
+    O,H,L,C,D,W=F['O'],F['H'],F['L'],F['C'],F['D'],F['W']; ends=F['ends']; N=F['N']
+    rows=[]; i=0; cd=-1; cw=-1; paid=0; shadow=False; wdD=0.; wdW=0.
+    while i<N:
+        d=int(D[i]); w=int(W[i])
+        if w!=cw: cw=w; wdW=0.
+        if d!=cd: cd=d; paid=0; shadow=False; wdD=0.
+        if paid>=maxpaid or occ[i]>0 or (eL[i]==0 and eS[i]==0): i+=1; continue
+        if baseDay[i]+wdD>=day_gate or baseWeek[i]+wdW>=week_gate or baseDay[i]+wdD<=-max_day_loss: i+=1; continue
+        di=1 if eL[i] else -1
+        signal_i=i
+        if shadow:
+            ve=float(O[i]); j=i; ok=False
+            while j<=ends[d]:
+                if occ[j]>0 or start_arr[j]>0: break
+                if (di==1 and rS[j]) or (di==-1 and rL[j]): break
+                if di==1:
+                    if O[j]<=ve-10 or L[j]<=ve-10: break
+                    if H[j]>=ve+proof:
+                        if j+1<=ends[d] and occ[j+1]==0 and start_arr[j+1]==0: i=j+1; ok=True
+                        break
+                else:
+                    if O[j]>=ve+10 or H[j]>=ve+10: break
+                    if L[j]<=ve-proof:
+                        if j+1<=ends[d] and occ[j+1]==0 and start_arr[j+1]==0: i=j+1; ok=True
+                        break
+                j+=1
+            if not ok:
+                i=max(i+1,j+1); continue
+            if baseDay[i]+wdD>=day_gate or baseWeek[i]+wdW>=week_gate: continue
+        if i>=N or D[i]!=d or occ[i]>0: i+=1; continue
+        ep=float(O[i]); ei=i; mfe=0.; paid+=1; j=i; xp=ep; reason='DAY_END'
+        while j<=ends[d]:
+            if j>i and start_arr[j]>0: xp=float(O[j]); reason='R4_OR_PRIOR_LAYER_HANDOFF'; break
+            if j>i and ((di==1 and rS[j]) or (di==-1 and rL[j])): xp=float(O[j]); reason='OPPOSITE_5M_BREAK'; break
+            floor=-10.
+            if mfe>=arm0: floor=0.
+            if mfe>=arm25: floor=25.
+            if mfe>=arm50: floor=50.
+            sl=ep+di*floor
+            if di==1:
+                if O[j]<=sl: xp=float(O[j]); reason='STOP_GAP'; break
+                if L[j]<=sl: xp=float(sl); reason='STOP'; break
+                if target<999 and H[j]>=ep+target: xp=float(ep+target); mfe=max(mfe,target); reason='TARGET'; break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl: xp=float(O[j]); reason='STOP_GAP'; break
+                if H[j]>=sl: xp=float(sl); reason='STOP'; break
+                if target<999 and L[j]<=ep-target: xp=float(ep-target); mfe=max(mfe,target); reason='TARGET'; break
+                mfe=max(mfe,float(ep-L[j]))
+            if j==ends[d]: xp=float(C[j]); reason='DAY_END'; break
+            j+=1
+        p=float(di*(xp-ep)); wdD+=p; wdW+=p
+        rows.append(dict(Module=layer,Direction='LONG' if di==1 else 'SHORT',Signal_Time=pd.Timestamp(F['T'][signal_i]),
+                         Entry_Time=pd.Timestamp(F['T'][ei]),Entry_Price=ep,Exit_Time=pd.Timestamp(F['T'][j]),Exit_Price=xp,
+                         Points=p,Exit_Reason=reason,MFE=float(mfe),Initial_Stop=10.0))
+        shadow=p<=0; i=j+1
+    return pd.DataFrame(rows)
+
+
+def _r5_add_layer(F,trades,occ,start_arr,live_day,live_week,day_real,week_real):
+    occo=occ.copy(); sto=start_arr.copy(); addD=np.zeros(F['N']); addW=np.zeros(F['N']); trD=np.zeros(F['nd']); trW=np.zeros(F['nw'])
+    if trades is not None and len(trades):
+        for r in trades.itertuples(index=False):
+            s=int(np.searchsorted(F['T'],np.datetime64(r.Entry_Time),'left')); e=int(np.searchsorted(F['T'],np.datetime64(r.Exit_Time),'left')); pp=float(r.Points)
+            if not (0<=s<F['N'] and 0<=e<F['N']): continue
+            occo[s:e+1]=1; sto[s]=1; trD[F['D'][e]]+=pp; trW[F['W'][e]]+=pp
+            if e+1<F['N']:
+                if F['D'][e+1]==F['D'][e]: addD[e+1]+=pp
+                if F['W'][e+1]==F['W'][e]: addW[e+1]+=pp
+    dl=live_day.copy(); wl=live_week.copy()
+    for ss,ee in zip(F['starts'],F['ends']): dl[ss:ee+1]+=np.cumsum(addD[ss:ee+1])
+    for wi in range(F['nw']):
+        ix=np.flatnonzero(F['W']==wi)
+        if len(ix): wl[ix]+=np.cumsum(addW[ix])
+    return occo,sto,dl,wl,day_real+trD,week_real+trW
+
+
+def _r5_c2145_arrays(F):
+    c15=F['c15']; fast=ema(c15,21); slow=ema(c15,45); gap=fast-slow; sign=np.sign(gap); prev=np.r_[0,sign[:-1]]
+    trend=np.zeros(F['N'],np.int8); cross=np.zeros(F['N'],np.int8)
+    l15=F['l15']
+    for k in range(len(l15)):
+        ii=int(l15[k]+1)
+        if ii>=F['N']: continue
+        jj=F['N'] if k+1==len(l15) else int(l15[k+1]+1)
+        d=1 if gap[k]>0 else -1; trend[ii:jj]=d
+        if sign[k]>0 and prev[k]<=0: cross[ii]=1
+        elif sign[k]<0 and prev[k]>=0: cross[ii]=-1
+    # Fresh completed 5m EMA5/10 breakout of previous four completed 5m bars.
+    rh4,rl4=F['roll'][4]; br=np.zeros(F['N'],np.int8)
+    valid=(F['bn']>=5)&F['same']&np.isfinite(rh4)&np.isfinite(rl4)
+    blg=valid&(F['e5']>F['e10'])&(F['bc']>rh4)&(F['prevc']<=rh4)
+    bsg=valid&(F['e5']<F['e10'])&(F['bc']<rl4)&(F['prevc']>=rl4)
+    br[F['nxt'][blg]]=1; br[F['nxt'][bsg]]=-1
+    return trend,cross,br
+
+
+def _r5_sim_c2145(F,occ,start_arr,trend,cross,br5):
+    O,H,L,C,D=F['O'],F['H'],F['L'],F['C'],F['D']; ends=F['ends']; N=F['N']
+    rows=[]; i=0; pos=False; di=0; ep=0.; ei=0; mfe=0.; mend=0; pending=0; rolls=0; entry_reason=''
+    while i<N:
+        dday=int(D[i])
+        if cross[i]!=0:
+            pending=int(cross[i]); rolls=0
+        if not pos:
+            if occ[i]>0: i+=1; continue
+            td=int(trend[i]); enter=False; entry_i=i; signal_i=i
+            if cross[i]!=0:
+                di=int(cross[i]); pending=0
+                # Shadow the raw 15m EMA21/45 crossover until +25 proves before -10.
+                ve=float(O[i]); j=i; ok=False
+                while j<=ends[dday]:
+                    if occ[j]>0 or start_arr[j]>0: break
+                    if trend[j]!=0 and trend[j]!=di: break
+                    if di==1:
+                        if O[j]<=ve-10 or L[j]<=ve-10: break
+                        if H[j]>=ve+25:
+                            if j+1<=ends[dday] and occ[j+1]==0 and start_arr[j+1]==0 and trend[j+1]==di:
+                                entry_i=j+1; ok=True
+                            break
+                    else:
+                        if O[j]>=ve+10 or H[j]>=ve+10: break
+                        if L[j]<=ve-25:
+                            if j+1<=ends[dday] and occ[j+1]==0 and start_arr[j+1]==0 and trend[j+1]==di:
+                                entry_i=j+1; ok=True
+                            break
+                    j+=1
+                if not ok:
+                    i=max(i+1,j+1); continue
+                i=entry_i; dday=int(D[i]); enter=True; entry_reason='CROSS_PROOF'
+            elif pending!=0 and td==pending and br5[i]==td:
+                di=td; enter=True; pending=0; entry_reason='PENDING_5M_BREAKOUT'
+            elif rolls>0 and rolls<=1 and td==di and br5[i]==td:
+                enter=True; entry_reason='TWO_DAY_ROLL_REENTRY'
+            if not enter: i+=1; continue
+            pos=True; ep=float(O[i]); ei=i; mfe=0.; targetd=int(D[i])+1
+            if targetd>=len(ends): targetd=len(ends)-1
+            mend=int(ends[targetd])
+        exit_now=False; xp=ep; reason=''
+        if i>ei and start_arr[i]>0: xp=float(O[i]); reason='R4_OR_PRIOR_LAYER_HANDOFF'; exit_now=True
+        elif i>ei and trend[i]!=0 and trend[i]!=di: xp=float(O[i]); reason='EMA21_45_REVERSAL'; exit_now=True
+        else:
+            floor=-10.
+            if mfe>=40: floor=0.
+            if mfe>=70: floor=25.
+            sl=ep+di*floor
+            if di==1:
+                if O[i]<=sl: xp=float(O[i]); reason='STOP_GAP'; exit_now=True
+                elif L[i]<=sl: xp=float(sl); reason='STOP'; exit_now=True
+                else: mfe=max(mfe,float(H[i]-ep))
+            else:
+                if O[i]>=sl: xp=float(O[i]); reason='STOP_GAP'; exit_now=True
+                elif H[i]>=sl: xp=float(sl); reason='STOP'; exit_now=True
+                else: mfe=max(mfe,float(ep-L[i]))
+            if (not exit_now) and i>=mend: xp=float(C[i]); reason='TWO_DAY_EXIT'; exit_now=True
+        if not exit_now: i+=1; continue
+        pp=float(di*(xp-ep))
+        rows.append(dict(Module='C2145',Direction='LONG' if di==1 else 'SHORT',Signal_Time=pd.Timestamp(F['T'][signal_i]),
+                         Entry_Time=pd.Timestamp(F['T'][ei]),Entry_Price=ep,Exit_Time=pd.Timestamp(F['T'][i]),Exit_Price=xp,
+                         Points=pp,Exit_Reason=reason,MFE=float(mfe),Initial_Stop=10.0,Entry_Reason=entry_reason))
+        pos=False
+        if reason=='TWO_DAY_EXIT' and trend[i]==di: rolls+=1
+        elif reason in ('R4_OR_PRIOR_LAYER_HANDOFF','EMA21_45_REVERSAL'): rolls=0
+        i+=1
+    return pd.DataFrame(rows)
+
+
+def _r5_combined_metrics(realized):
+    q=realized.sort_values(['Exit_Time','Entry_Time']).reset_index(drop=True)
+    p=q.Points.to_numpy(float); gp=float(p[p>0].sum()); gl=float(-p[p<0].sum())
+    eq=np.cumsum(p); pk=np.maximum.accumulate(np.r_[0.,eq]); dd=float(np.max(pk[1:]-eq)) if len(p) else 0.0
+    return {'net':float(p.sum()),'pf':float(gp/gl if gl else np.inf),'dd':dd,'trades':int(len(p)),'win_rate':float((p>0).mean()*100 if len(p) else 0.0)}
+
+
+# =============================================================================
+# R6 ACCEPTED FILTER: B MIDDAY NO-ENTRY WINDOW
+# =============================================================================
+# This is a live-known session-time filter only. It blocks NEW R5-B entries
+# from 11:30 through 12:59. It does not alter already-open trades or the
+# opposite-break arrays used for exits. No date, historical trade, or P&L
+# lookup is used.
+R6_B_NO_ENTRY_START_MIN = 11*60 + 30
+R6_B_NO_ENTRY_END_MIN = 13*60
+
+def _r6_filter_b_midday_entries(F, sig):
+    eL,eS,rL,rS=[x.copy() for x in sig]
+    minute=F['x'].timestamp.dt.hour.to_numpy()*60 + F['x'].timestamp.dt.minute.to_numpy()
+    blocked=(minute>=R6_B_NO_ENTRY_START_MIN)&(minute<R6_B_NO_ENTRY_END_MIN)
+    eL[blocked]=0
+    eS[blocked]=0
+    return eL,eS,rL,rS
+
+
+# =============================================================================
+# R7 ACCEPTED SHORT-CHILD LAYERS
+# =============================================================================
+# R7 extends the verified R6 engine with live-causal, runtime-generated child
+# trades. No historical trade row, timestamp, date exception, or precomputed
+# P&L is embedded. All layer state (day/week P&L, loss streak, occupancy) is
+# rebuilt from trades generated earlier in the SAME run.
+R7_RULES = {
+    'R7_1_IMPULSE': {
+        'tf':'15m->5m','expansion_min':1.60,'body_min':0.70,'confirm_minutes':45,
+        'loss_streak_min':2,'week_min':-10.0,'week_max':0.0,'day_max':10.0,
+        'exclude_start_min':630,'exclude_end_min':840,'initial_stop':10.0,
+        'be_mfe':30.0,'lock_mfe':70.0,'lock_points':25.0,'trail_arm':120.0,'trail_dist':50.0,
+        'max_trading_days':2,'max_per_day':1,
+    },
+    'R7_2_QUIET_PARENT': {
+        'compression_ratio':0.62,'body_min':0.40,'week_min':-20.0,'week_max':0.0,
+        'loss_streak_min':1,'shadow_proof':10.0,'shadow_fail':10.0,'proof_window_minutes':45,
+        'initial_stop':10.0,'be_mfe':30.0,'lock_mfe':70.0,'lock_points':25.0,
+        'trail_arm':120.0,'trail_dist':50.0,'max_trading_days':2,'max_per_day':1,
+    },
+    'R7_3_STRONG_MICRO': {
+        'expansion_min':2.10,'body_min':0.55,'week_min':-5.0,'week_max':0.0,
+        'loss_streak_min':2,'loss_streak_max':3,'target':35.0,'initial_stop':10.0,
+        'be_mfe':15.0,'lock_mfe':30.0,'lock_points':5.0,'max_per_day':1,
+        'exclude_1':[765,840],'exclude_2':[870,930],
+    },
+    'R7_4_STRONG_CHILD': {
+        'expansion_min':2.05,'body_min':0.60,'breakout_extension_min':0.05,
+        'week_min':-10.0,'week_max':0.0,'loss_streak_min':0,'loss_streak_max':2,
+        'target':40.0,'initial_stop':10.0,'be_mfe':15.0,'lock_mfe':30.0,'lock_points':5.0,
+        'max_per_day':1,'exclude_1':[765,840],'exclude_2':[870,930],
+    },
+    'R7_5_INTERMEDIATE': {
+        'expansion_min':1.90,'expansion_max':2.05,'body_min':0.60,'breakout_extension_min':0.10,
+        'prior3_compression_max':1.50,'week_min':-10.0,'week_max':0.0,
+        'loss_streak_min':0,'loss_streak_max':2,'target':40.0,'initial_stop':10.0,
+        'be_mfe':15.0,'lock_mfe':30.0,'lock_points':5.0,'max_per_day':1,
+        'exclude_1':[765,840],'exclude_2':[870,930],
+    },
+    'R7_6_SECOND_CHILD': {
+        'expansion_min':1.90,'body_min':0.55,'ema_gap_norm_min':0.10,'breakout_extension_min':0.10,
+        'min_minutes_since_prior_1p9_signal':20,'week_min':-10.0,'week_max':0.0,
+        'loss_streak_min':1,'loss_streak_max':3,'target':25.0,'initial_stop':10.0,
+        'be_mfe':15.0,'lock_mfe':30.0,'lock_points':5.0,'max_per_day':2,
+        'exclude_1':[765,840],'exclude_2':[870,930],
+    },
+    'R7_7_MORNING_PROOF_LONG': {
+        'direction':'LONG','body_min':0.60,'week_min':-10.0,'week_max':0.0,
+        'loss_streak_min':1,'loss_streak_max':3,'shadow_proof':18.0,'proof_window_minutes':45,
+        'signal_end_min':750,'target':20.0,'initial_stop':10.0,'be_mfe':15.0,
+        'lock_mfe':25.0,'lock_points':5.0,'max_per_day':1,
+    },
+    'R7_8_LATE_CHILD': {
+        'include_start_min':840,'include_end_min':870,'expansion_min':1.60,'body_min':0.55,
+        'ema_gap_norm_min':0.15,'breakout_extension_min':0.03,'week_min':-10.0,'week_max':0.0,
+        'loss_streak_min':0,'loss_streak_max':2,'target':20.0,'initial_stop':10.0,
+        'be_mfe':15.0,'lock_mfe':30.0,'lock_points':5.0,'max_per_day':1,
+    },
+}
+
+
+def _r7_monday(t):
+    t=pd.Timestamp(t); return (t-pd.Timedelta(days=t.weekday())).normalize()
+
+
+def _r7_detail_from_r6(core,swing,repair_a,repair_b,A,B5,C15):
+    parts=[]
+    if len(core): parts.append(pd.DataFrame({'Module':'CORE','Direction':core.Direction,'Entry_Time':core.Entry_Time,'Exit_Time':core.Exit_Time,'Points':core.Points}))
+    if len(swing): parts.append(pd.DataFrame({'Module':'SWING','Direction':np.where(swing.d.to_numpy(float)>0,'LONG','SHORT'),'Entry_Time':swing.Entry_Time,'Exit_Time':swing.Exit_Time,'Points':swing.Points}))
+    for z,name in [(repair_a,'REPAIR_A'),(repair_b,'REPAIR_B'),(A,'R5_A'),(B5,'R5_B'),(C15,'C2145')]:
+        if z is None or not len(z): continue
+        direction=z.Direction if 'Direction' in z.columns else np.where(z.d.to_numpy(float)>0,'LONG','SHORT')
+        module=z.Module if 'Module' in z.columns else name
+        parts.append(pd.DataFrame({'Module':module,'Direction':direction,'Entry_Time':z.Entry_Time,'Exit_Time':z.Exit_Time,'Points':z.Points}))
+    q=pd.concat(parts,ignore_index=True)
+    q.Entry_Time=pd.to_datetime(q.Entry_Time); q.Exit_Time=pd.to_datetime(q.Exit_Time)
+    return q.sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+
+
+def _r7_simple_layer(name,T,oe,ox,op,od):
+    if len(op)==0:
+        return pd.DataFrame(columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+    return pd.DataFrame({'Module':name,'Direction':np.where(np.asarray(od)>0,'LONG','SHORT'),
+                         'Entry_Time':pd.to_datetime(T[np.asarray(oe,dtype=int)]),
+                         'Exit_Time':pd.to_datetime(T[np.asarray(ox,dtype=int)]),
+                         'Points':np.asarray(op,float)})
+
+
+def _r7_metrics_detail(q):
+    q=q.sort_values(['Exit_Time','Entry_Time']).reset_index(drop=True)
+    p=q.Points.to_numpy(float); gp=float(p[p>0].sum()); gl=float(-p[p<0].sum())
+    pad=np.r_[0.,np.cumsum(p)]; pk=np.maximum.accumulate(pad)
+    return {'net':float(p.sum()),'pf':float(gp/gl if gl else np.inf),'dd':float((pk-pad).max()),
+            'trades':int(len(p)),'win_rate':float((p>0).mean()*100 if len(p) else 0.)}
+
+
+def _r7_period_counts(df,q):
+    days=sorted(pd.to_datetime(df.timestamp).dt.date.unique())
+    weeks=sorted(set(_r7_monday(v) for v in days))
+    qq=q.copy(); qq['D2']=pd.to_datetime(qq.Exit_Time).dt.date; qq['W2']=pd.to_datetime(qq.Exit_Time).map(_r7_monday)
+    ds=qq.groupby('D2').Points.sum(); ws=qq.groupby('W2').Points.sum()
+    dv=np.array([float(ds.get(x,0.)) for x in days]); wv=np.array([float(ws.get(x,0.)) for x in weeks])
+    return {'daily':{'positive':int((dv>0).sum()),'negative':int((dv<0).sum()),'flat':int((dv==0).sum())},
+            'weekly':{'green':int((wv>0).sum()),'red':int((wv<0).sum()),'flat':int((wv==0).sum())}}
+
+
+def _r7_ids(df):
+    dates=pd.to_datetime(df.timestamp).dt.normalize(); D,ud=pd.factorize(dates); D=D.astype(np.int32)
+    wdate=dates-pd.to_timedelta(dates.dt.weekday,unit='D'); W,uw=pd.factorize(wdate); W=W.astype(np.int32)
+    N=len(df); starts=np.r_[0,np.flatnonzero(D[1:]!=D[:-1])+1].astype(int); ends=np.r_[starts[1:]-1,N-1].astype(int)
+    day_end=np.empty(N,int)
+    for s,e in zip(starts,ends): day_end[s:e+1]=e
+    return D,ud,W,uw,starts,ends,day_end
+
+
+def _r7_state(df,base,next_minute_realization=False):
+    T=pd.to_datetime(df.timestamp).to_numpy('datetime64[ns]'); N=len(df); D,ud,W,uw,starts,ends,day_end=_r7_ids(df)
+    ent=np.searchsorted(T,pd.to_datetime(base.Entry_Time).to_numpy('datetime64[ns]'),'left').astype(np.int64)
+    ext=np.searchsorted(T,pd.to_datetime(base.Exit_Time).to_numpy('datetime64[ns]'),'left').astype(np.int64)
+    diff=np.zeros(N+1,np.int32); bst=np.zeros(N,np.int8)
+    for a,e in zip(ent,ext):
+        if a<N: diff[a]+=1; bst[a]=1
+        if e<N and e+1<=N: diff[e+1]-=1
+    occ=np.cumsum(diff[:-1])>0
+    exitp=np.zeros(N,float)
+    for e,p in zip(ext,base.Points.to_numpy(float)):
+        if e<N:
+            ix=e+1 if next_minute_realization else e
+            if ix<N: exitp[ix]+=float(p)
+    live_day=np.zeros(N,float); live_week=np.zeros(N,float)
+    for s,e in zip(starts,ends): live_day[s:e+1]=np.cumsum(exitp[s:e+1])
+    wstarts=np.r_[0,np.flatnonzero(W[1:]!=W[:-1])+1].astype(int); wends=np.r_[wstarts[1:]-1,N-1].astype(int)
+    for s,e in zip(wstarts,wends): live_week[s:e+1]=np.cumsum(exitp[s:e+1])
+    # dynamic loss streak, available at exit minute or next minute according to mode
+    mark=np.full(N,np.nan); st=0
+    order=np.argsort(ext,kind='stable')
+    for j in order:
+        e=int(ext[j]); p=float(base.Points.iloc[j]); st=st+1 if p<=0 else 0
+        ix=e+1 if next_minute_realization else e
+        if 0<=ix<N: mark[ix]=st
+    lsarr=pd.Series(mark).ffill().fillna(0).to_numpy(np.int16)
+    nextbst=np.full(N,N,np.int64); nb=N
+    for i in range(N-1,-1,-1):
+        if bst[i]: nb=i
+        nextbst[i]=nb
+    oo=np.argsort(ext,kind='stable'); bext=ext[oo]; bp=base.Points.to_numpy(float)[oo]
+    return {'T':T,'D':D,'ud':ud,'W':W,'uw':uw,'starts':starts,'ends':ends,'day_end':day_end,
+            'ent':ent,'ext':ext,'occ':occ,'bst':bst,'live_day':live_day,'live_week':live_week,
+            'lsarr':lsarr,'nextbst':nextbst,'bext':bext,'bp':bp}
+
+
+def _r7_bars(df,tf):
+    x=df.copy(); m=x.timestamp.dt.hour*60+x.timestamp.dt.minute; x['day']=x.timestamp.dt.normalize(); x['bucket']=((m-555)//tf).astype(int); x['idx']=np.arange(len(x))
+    return x.groupby(['day','bucket'],sort=False).agg(first_idx=('idx','first'),last_idx=('idx','last'),start=('timestamp','first'),end=('timestamp','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),cnt=('idx','size')).reset_index(drop=True)
+
+
+def _r7_common_context(df):
+    T=pd.to_datetime(df.timestamp).to_numpy('datetime64[ns]'); O=df.open.to_numpy(float); H=df.high.to_numpy(float); L=df.low.to_numpy(float); C=df.close.to_numpy(float); N=len(df)
+    D,ud,W,uw,starts,ends,day_end=_r7_ids(df)
+    b5=_r7_bars(df,5); b15=_r7_bars(df,15); b30=_r7_bars(df,30)
+    for b in (b5,b15,b30):
+        b['range']=b.high-b.low; b['bodyr']=(b.close-b.open)/b['range'].replace(0,np.nan)
+    for b in (b5,b15):
+        b['e5']=b.close.ewm(span=5,adjust=False).mean(); b['e10']=b.close.ewm(span=10,adjust=False).mean()
+    b30['e19']=b30.close.ewm(span=19,adjust=False).mean(); b30['e29']=b30.close.ewm(span=29,adjust=False).mean()
+    b5['rh4']=b5.high.shift(1).rolling(4,min_periods=4).max(); b5['rl4']=b5.low.shift(1).rolling(4,min_periods=4).min(); b5['med12']=b5['range'].shift(1).rolling(12,min_periods=8).median(); b5['avg3']=b5['range'].shift(1).rolling(3,min_periods=3).mean()
+    b15['rh4']=b15.high.shift(1).rolling(4,min_periods=4).max(); b15['rl4']=b15.low.shift(1).rolling(4,min_periods=4).min(); b15['med8']=b15['range'].shift(1).rolling(8,min_periods=6).median(); b15['exp']=b15['range']/b15.med8
+    b15['prevclose']=b15.close.shift(1); tr=np.maximum((b15.high-b15.low).to_numpy(float),np.maximum((b15.high-b15.prevclose).abs().to_numpy(float),(b15.low-b15.prevclose).abs().to_numpy(float)))
+    b15['atr14']=pd.Series(tr).rolling(14,min_periods=14).mean(); b15['gap']=abs(b15.e5-b15.e10); b15['gapnorm']=b15.gap/b15.atr14; b15['gapratio']=b15.gap/b15.gap.shift(1)
+    li5=b5.last_idx.to_numpy(np.int64); li15=b15.last_idx.to_numpy(np.int64); li30=b30.last_idx.to_numpy(np.int64)
+    # completed 15m state mapped to minutes
+    map15_m=np.searchsorted(li15,np.arange(N),side='right')-1; d15_m=np.zeros(N,np.int8); ok=map15_m>=0; jj=np.maximum(map15_m,0); e155=b15.e5.to_numpy(float); e1510=b15.e10.to_numpy(float); d15_m[ok]=np.where(e155[jj[ok]]>e1510[jj[ok]],1,-1)
+    # micro candidates
+    nxt5=li5+1; valid5=nxt5<N; vi=np.flatnonzero(valid5); valid5[vi]=D[nxt5[vi]]==D[li5[vi]]
+    map15_5=np.searchsorted(li15,li5,side='right')-1; gn15=b15.gapnorm.to_numpy(float); gr15=b15.gapratio.to_numpy(float)
+    d15_5=np.zeros(len(b5),np.int8); g15_5=np.full(len(b5),np.nan); gr15_5=np.full(len(b5),np.nan); ok=map15_5>=0; jj=np.maximum(map15_5,0)
+    d15_5[ok]=np.where(e155[jj[ok]]>e1510[jj[ok]],1,-1); g15_5[ok]=gn15[jj[ok]]; gr15_5[ok]=gr15[jj[ok]]
+    rng=b5['range'].to_numpy(float); med=b5.med12.to_numpy(float); body=np.abs(b5.bodyr.to_numpy(float)); body_signed=b5.bodyr.to_numpy(float); e5=b5.e5.to_numpy(float); e10=b5.e10.to_numpy(float); rh=b5.rh4.to_numpy(float); rl=b5.rl4.to_numpy(float); bc=b5.close.to_numpy(float)
+    rows=[]; qrows=[]
+    for q in range(len(b5)):
+        if not valid5[q] or int(b5.cnt.iloc[q])<5 or not np.isfinite(med[q]) or med[q]<=0: continue
+        ex=float(rng[q]/med[q]); d=0; br=0.
+        if d15_5[q]==1 and e5[q]>e10[q] and np.isfinite(rh[q]) and bc[q]>rh[q] and body_signed[q]>0:
+            d=1; br=float((bc[q]-rh[q])/max(rng[q],1e-9))
+        elif d15_5[q]==-1 and e5[q]<e10[q] and np.isfinite(rl[q]) and bc[q]<rl[q] and body_signed[q]<0:
+            d=-1; br=float((rl[q]-bc[q])/max(rng[q],1e-9))
+        if d:
+            ei=int(nxt5[q]); mn=pd.Timestamp(T[ei]).hour*60+pd.Timestamp(T[ei]).minute
+            precomp=float(np.mean(rng[q-3:q])/med[q]) if q>=3 and np.isfinite(med[q]) and med[q]>0 else 999.
+            rows.append((ei,d,ex,float(body[q]),float(g15_5[q]) if np.isfinite(g15_5[q]) else -1.,float(gr15_5[q]) if np.isfinite(gr15_5[q]) else -1.,br,mn,precomp,q))
+    # first19 / since19 across candidate sequence, matching research harness
+    cnt_by_day={}; last_by_day={}; out=[]
+    for row in rows:
+        ei=row[0]; dd=int(D[ei]); cnt=cnt_by_day.get(dd,0); last=last_by_day.get(dd,None); since=(ei-last) if last is not None else 9999
+        out.append(row+(cnt,since))
+        if row[2]>=1.90:
+            cnt_by_day[dd]=cnt+1; last_by_day[dd]=ei
+    cand=np.array(out,float) if out else np.empty((0,12),float)
+    return {'T':T,'O':O,'H':H,'L':L,'C':C,'N':N,'D':D,'ud':ud,'W':W,'uw':uw,'starts':starts,'ends':ends,'day_end':day_end,
+            'b5':b5,'b15':b15,'b30':b30,'li5':li5,'li15':li15,'li30':li30,'d15_m':d15_m,'cand':cand}
+
+
+def _r7_dynamic_streak_at(base_ext,base_pts,entry_i,bj,streak,lastproc):
+    while bj<len(base_ext) and base_ext[bj]<=entry_i:
+        if base_ext[bj]>lastproc:
+            streak=streak+1 if base_pts[bj]<=0 else 0
+        bj+=1
+    return bj,streak,max(lastproc,entry_i)
+
+
+def _r7_sim_micro(ctx,base,cfg,name):
+    st=_r7_state(pd.DataFrame({'timestamp':pd.to_datetime(ctx['T'])}),base) if False else None
+    # build state using the original OHLC frame stored externally by caller through ctx['df']
+    state=_r7_state(ctx['df'],base,False)
+    T,O,H,L,C,D,W,day_end=ctx['T'],ctx['O'],ctx['H'],ctx['L'],ctx['C'],ctx['D'],ctx['W'],ctx['day_end']; cand=ctx['cand']; d15_m=ctx['d15_m']; N=ctx['N']
+    occ,bst,ld,lw,bext,bp,nextbst=state['occ'],state['bst'],state['live_day'],state['live_week'],state['bext'],state['bp'],state['nextbst']
+    addW=np.zeros(len(state['uw'])); addD=np.zeros(len(state['ud'])); used=np.zeros(len(state['ud']),np.int16)
+    rows=[]; busy=-1; bj=0; streak=0; lastproc=-1
+    for r in cand:
+        ei=int(r[0]); d=int(r[1]); sexp,sbody,sgn,sgr,sbr,mn,precomp,first19,since19=float(r[2]),float(r[3]),float(r[4]),float(r[5]),float(r[6]),int(r[7]),float(r[8]),int(r[10]),int(r[11])
+        bj,streak,lastproc=_r7_dynamic_streak_at(bext,bp,ei,bj,streak,lastproc)
+        if ei<=busy or occ[ei]: continue
+        if sexp<cfg.get('expansion_min',-1e9) or sexp>=cfg.get('expansion_max',1e9): continue
+        if sbody<cfg.get('body_min',0.) or sgn<cfg.get('ema_gap_norm_min',-1e9) or sgr<cfg.get('ema_gap_ratio_min',-1e9) or sbr<cfg.get('breakout_extension_min',-1e9): continue
+        if precomp>cfg.get('prior3_compression_max',1e9) or first19>cfg.get('first19_max',999999) or since19<cfg.get('min_since_1p9',0): continue
+        mode=cfg.get('direction_mode',0)
+        if mode==1 and d!=1: continue
+        if mode==-1 and d!=-1: continue
+        if cfg.get('include_start_min') is not None and not (cfg['include_start_min']<=mn<cfg['include_end_min']): continue
+        for key in ('exclude_1','exclude_2'):
+            w=cfg.get(key)
+            if w is not None and w[0]<=mn<w[1]: break
+        else:
+            w=None
+        if w is not None: continue
+        dd=int(D[ei]); ww=int(W[ei])
+        if used[dd]>=cfg.get('max_per_day',1): continue
+        wk=float(lw[ei]+addW[ww]); dy=float(ld[ei]+addD[dd])
+        if wk<cfg.get('week_min',-1e9) or wk>cfg.get('week_max',1e9) or streak<cfg.get('loss_streak_min',0) or streak>cfg.get('loss_streak_max',999999) or dy>=cfg.get('day_max',20.): continue
+        zend=int(day_end[ei]); nb=int(nextbst[ei]);
+        if nb>ei and nb<zend: zend=nb
+        ep=float(O[ei]); mfe=0.; xp=float(C[zend]); xi=zend; reason='DAY_END'
+        for j in range(ei,zend+1):
+            if j>ei and bst[j]: xp=float(O[j]); xi=j; reason='BASE_HANDOFF'; break
+            if j>ei and d15_m[j]!=0 and d15_m[j]!=d: xp=float(O[j]); xi=j; reason='15M_REV'; break
+            floor=-float(cfg.get('initial_stop',10.))
+            if mfe>=cfg.get('be_mfe',15.): floor=0.
+            if mfe>=cfg.get('lock_mfe',30.): floor=float(cfg.get('lock_points',5.))
+            sl=ep+d*floor; target=float(cfg.get('target',1e9))
+            if d==1:
+                if O[j]<=sl: xp=float(O[j]); xi=j; reason='STOP_GAP'; break
+                if L[j]<=sl: xp=float(sl); xi=j; reason='STOP'; break
+                if H[j]>=ep+target: xp=ep+target; xi=j; mfe=max(mfe,target); reason='TARGET'; break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl: xp=float(O[j]); xi=j; reason='STOP_GAP'; break
+                if H[j]>=sl: xp=float(sl); xi=j; reason='STOP'; break
+                if L[j]<=ep-target: xp=ep-target; xi=j; mfe=max(mfe,target); reason='TARGET'; break
+                mfe=max(mfe,float(ep-L[j]))
+        pp=float(d*(xp-ep)); addW[ww]+=pp; addD[dd]+=pp; used[dd]+=1; busy=xi
+        bj,streak,lastproc=_r7_dynamic_streak_at(bext,bp,xi,bj,streak,lastproc)
+        streak=streak+1 if pp<=0 else 0; lastproc=max(lastproc,xi)
+        rows.append({'Module':name,'Direction':'LONG' if d==1 else 'SHORT','Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':pp,'MFE':float(mfe),'Exit_Reason':reason})
+    return pd.DataFrame(rows)
+
+
+def _r7_layer1(df,base,ctx):
+    state=_r7_state(df,base,False); T,O,H,L,C,N=ctx['T'],ctx['O'],ctx['H'],ctx['L'],ctx['C'],ctx['N']; D,W=ctx['D'],ctx['W']; day_end=ctx['day_end']; b5,b15=ctx['b5'],ctx['b15']; d15_m=ctx['d15_m']
+    # fresh completed 5m breakout candidate by direction
+    cand={1:[], -1:[]}; li5=b5.last_idx.to_numpy(int)
+    e5=b5.e5.to_numpy(float);e10=b5.e10.to_numpy(float);rh=b5.rh4.to_numpy(float);rl=b5.rl4.to_numpy(float);bc=b5.close.to_numpy(float)
+    for q,r in b5.iterrows():
+        if int(r.cnt)<5: continue
+        ei=int(r.last_idx)+1
+        if ei>=N or D[ei]!=D[int(r.last_idx)]: continue
+        if e5[q]>e10[q] and np.isfinite(rh[q]) and bc[q]>rh[q]: cand[1].append((ei,q))
+        if e5[q]<e10[q] and np.isfinite(rl[q]) and bc[q]<rl[q]: cand[-1].append((ei,q))
+    for d in cand: cand[d]=np.array(cand[d],dtype=int) if cand[d] else np.empty((0,2),int)
+    sig=[]
+    for q,r in b15.iterrows():
+        if int(r.cnt)<15 or not np.isfinite(r.exp) or float(r.exp)<1.6 or abs(float(r.bodyr))<.70: continue
+        d=0
+        if r.e5>r.e10 and r.bodyr>0 and np.isfinite(r.rh4) and r.close>r.rh4: d=1
+        elif r.e5<r.e10 and r.bodyr<0 and np.isfinite(r.rl4) and r.close<r.rl4: d=-1
+        if not d: continue
+        s=int(r.last_idx)+1
+        if s>=N: continue
+        arr=cand[d]; a=np.searchsorted(arr[:,0],s); z=np.searchsorted(arr[:,0],min(s+45,N-1),side='right')
+        for row in arr[a:z]:
+            ei=int(row[0])
+            if D[ei]!=D[s]: break
+            sig.append((ei,d)); break
+    sig=sorted(sig)
+    occ,bst,ld,lw,lsarr,nextbst=state['occ'],state['bst'],state['live_day'],state['live_week'],state['lsarr'],state['nextbst']
+    # two-session map
+    unique_days=list(pd.Index(pd.to_datetime(df.timestamp).dt.normalize().unique()).sort_values()); dpos={pd.Timestamp(v):i for i,v in enumerate(unique_days)}; dnorm=pd.to_datetime(df.timestamp).dt.normalize().to_numpy()
+    def two_end(ei):
+        p=dpos[pd.Timestamp(df.timestamp.iloc[ei]).normalize()]; td=unique_days[min(p+1,len(unique_days)-1)].to_datetime64(); ix=np.flatnonzero(dnorm==td); return int(ix[-1])
+    addW=np.zeros(len(state['uw']));addD=np.zeros(len(state['ud']));used=np.zeros(len(state['ud']),np.int8);busy=-1;rows=[]
+    for ei,d in sig:
+        if ei<=busy or occ[ei] or lsarr[ei]<2: continue
+        mn=pd.Timestamp(T[ei]).hour*60+pd.Timestamp(T[ei]).minute
+        if 630<=mn<840: continue
+        dd=int(D[ei]);ww=int(W[ei]);wk=float(lw[ei]+addW[ww]);dy=float(ld[ei]+addD[dd])
+        if wk<-10 or wk>0 or dy>=10 or used[dd]>=1: continue
+        zend=two_end(ei); nb=int(nextbst[ei]);
+        if nb>ei and nb<zend: zend=nb
+        ep=float(O[ei]);mfe=0.;xp=float(C[zend]);xi=zend;reason='TIME2D'
+        for j in range(ei,zend+1):
+            if j>ei and bst[j]:xp=float(O[j]);xi=j;reason='BASE_HANDOFF';break
+            if j>ei and d15_m[j]!=0 and d15_m[j]!=d:xp=float(O[j]);xi=j;reason='15M_REV';break
+            floor=-10.
+            if mfe>=30:floor=0.
+            if mfe>=70:floor=25.
+            if mfe>=120:floor=max(floor,mfe-50.)
+            sl=ep+d*floor
+            if d==1:
+                if O[j]<=sl:xp=float(O[j]);xi=j;reason='STOP_GAP';break
+                if L[j]<=sl:xp=float(sl);xi=j;reason='STOP';break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl:xp=float(O[j]);xi=j;reason='STOP_GAP';break
+                if H[j]>=sl:xp=float(sl);xi=j;reason='STOP';break
+                mfe=max(mfe,float(ep-L[j]))
+        pp=float(d*(xp-ep));addW[ww]+=pp;addD[dd]+=pp;used[dd]+=1;busy=xi
+        rows.append({'Module':'R7_1_IMPULSE','Direction':'LONG' if d==1 else 'SHORT','Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':pp,'MFE':mfe,'Exit_Reason':reason})
+    return pd.DataFrame(rows)
+
+
+def _r7_layer2(df,base,ctx):
+    # exact R7-2 uses next-minute realization of prior layer state.
+    state=_r7_state(df,base,True); T,O,H,L,C,N=ctx['T'],ctx['O'],ctx['H'],ctx['L'],ctx['C'],ctx['N'];D,W=ctx['D'],ctx['W']; day_end=ctx['day_end'];b5,b15,b30=ctx['b5'],ctx['b15'],ctx['b30'];d15_m=ctx['d15_m']
+    li5=b5.last_idx.to_numpy(int);li15=b15.last_idx.to_numpy(int);li30=b30.last_idx.to_numpy(int);nxt=li5+1;valid=nxt<N;ii=np.flatnonzero(valid);valid[ii]=D[nxt[ii]]==D[li5[ii]]
+    mp15=np.searchsorted(li15,li5,side='right')-1;mp30=np.searchsorted(li30,li5,side='right')-1
+    D15=np.zeros(len(b5),np.int8);D30=np.zeros(len(b5),np.int8);ok=mp15>=0;D15[ok]=np.where(b15.e5.to_numpy()[mp15[ok]]>b15.e10.to_numpy()[mp15[ok]],1,-1);ok=mp30>=0;D30[ok]=np.where(b30.e19.to_numpy()[mp30[ok]]>b30.e29.to_numpy()[mp30[ok]],1,-1)
+    qc=b5.avg3.to_numpy(float)<=.62*b5.med12.to_numpy(float);body=b5.bodyr.to_numpy(float);bc=b5.close.to_numpy(float);e5=b5.e5.to_numpy(float);e10=b5.e10.to_numpy(float);rh=b5.rh4.to_numpy(float);rl=b5.rl4.to_numpy(float);mins=(b5.end.dt.hour*60+b5.end.dt.minute).to_numpy(int)
+    up=(bc>rh)&(e5>e10)&np.isfinite(rh);dn=(bc<rl)&(e5<e10)&np.isfinite(rl)
+    Lm=valid&(D30==1)&(D15==1)&qc&up&(body>=.40)&(mins>=585)&(mins<=885); Sm=valid&(D30==-1)&(D15==-1)&qc&dn&(body<=-.40)&(mins>=585)&(mins<=885)
+    sig=sorted([(int(nxt[i]),1) for i in np.flatnonzero(Lm)]+[(int(nxt[i]),-1) for i in np.flatnonzero(Sm)])
+    occ,bst,ld,lw,lsarr,nextbst=state['occ'],state['bst'],state['live_day'],state['live_week'],state['lsarr'],state['nextbst']
+    unique_days=list(pd.Index(pd.to_datetime(df.timestamp).dt.normalize().unique()).sort_values());dpos={pd.Timestamp(v):i for i,v in enumerate(unique_days)};dnorm=pd.to_datetime(df.timestamp).dt.normalize().to_numpy()
+    def two_end(ei):
+        p=dpos[pd.Timestamp(df.timestamp.iloc[ei]).normalize()];td=unique_days[min(p+1,len(unique_days)-1)].to_datetime64();ix=np.flatnonzero(dnorm==td);return int(ix[-1])
+    addW=np.zeros(len(state['uw']));addD=np.zeros(len(state['ud']));used=np.zeros(len(state['ud']),np.int8);busy=-1;rows=[]
+    for si,d in sig:
+        if si<=busy or occ[si]:continue
+        dd=int(D[si]);ww=int(W[si]);wk=float(lw[si]+addW[ww]);dy=float(ld[si]+addD[dd])
+        if wk<-20 or wk>0 or dy>=10 or lsarr[si]<1 or used[dd]>=1:continue
+        ref=float(O[si]);lim=min(int(day_end[si]),si+45);hit=-1
+        for j in range(si,lim+1):
+            if occ[j] or (j>si and bst[j]):break
+            if d==1:
+                if O[j]<=ref-10 or L[j]<=ref-10:break
+                if H[j]>=ref+10:hit=j;break
+            else:
+                if O[j]>=ref+10 or H[j]>=ref+10:break
+                if L[j]<=ref-10:hit=j;break
+        if hit<0 or hit+1>day_end[si]:continue
+        ei=hit+1
+        if occ[ei]:continue
+        zend=two_end(ei);nb=int(nextbst[ei]);
+        if nb>ei and nb<zend:zend=nb
+        ep=float(O[ei]);mfe=0.;xp=float(C[zend]);xi=zend;reason='TIME2D'
+        for j in range(ei,zend+1):
+            if j>ei and bst[j]:xp=float(O[j]);xi=j;reason='BASE_HANDOFF';break
+            if j>ei and d15_m[j]!=0 and d15_m[j]!=d:xp=float(O[j]);xi=j;reason='15M_REV';break
+            floor=-10.
+            if mfe>=30:floor=0.
+            if mfe>=70:floor=25.
+            if mfe>=120:floor=max(floor,mfe-50.)
+            sl=ep+d*floor
+            if d==1:
+                if O[j]<=sl:xp=float(O[j]);xi=j;reason='STOP_GAP';break
+                if L[j]<=sl:xp=float(sl);xi=j;reason='STOP';break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl:xp=float(O[j]);xi=j;reason='STOP_GAP';break
+                if H[j]>=sl:xp=float(sl);xi=j;reason='STOP';break
+                mfe=max(mfe,float(ep-L[j]))
+        pp=float(d*(xp-ep));addW[ww]+=pp;addD[dd]+=pp;used[dd]+=1;busy=xi
+        rows.append({'Module':'R7_2_QUIET_PARENT','Direction':'LONG' if d==1 else 'SHORT','Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':pp,'MFE':mfe,'Exit_Reason':reason})
+    return pd.DataFrame(rows)
+
+
+
+try:
+    from numba import njit as _r7_njit
+except Exception:
+    def _r7_njit(*args, **kwargs):
+        def deco(fn): return fn
+        return deco
+
+@_r7_njit(cache=False)
+def _r7_morning_sim_fast(O,H,L,C,D,W,occ,bst,day_end,d15_m,ld,lw,bext,bp,nextbst,ca):
+    nw=int(W[-1])+1;nd=int(D[-1])+1;addW=np.zeros(nw);addD=np.zeros(nd);used=np.zeros(nd,np.int16)
+    oe=np.empty(len(ca),np.int64);ox=np.empty(len(ca),np.int64);op=np.empty(len(ca));od=np.empty(len(ca),np.int8);n=0
+    bj=0;streak=0;lastproc=-1;busy=-1
+    for k in range(len(ca)):
+        ei0=int(ca[k,0]);d=int(ca[k,2]);bucket=int(ca[k,3]);mn=555+(bucket+1)*5
+        while bj<len(bext) and bext[bj]<=ei0:
+            if bext[bj]>lastproc:
+                if bp[bj]<=0:streak+=1
+                else:streak=0
+            bj+=1
+        if ei0>lastproc:lastproc=ei0
+        if ei0<=busy or occ[ei0]!=0 or mn>=750 or ca[k,13]<0.60:continue
+        if d!=1:continue
+        lvl=ca[k,7]
+        if np.isnan(lvl) or ca[k,4]<=lvl:continue
+        dd=D[ei0];ww=W[ei0]
+        if used[dd]>=1:continue
+        wk=lw[ei0]+addW[ww];dy=ld[ei0]+addD[dd]
+        if wk<-10. or wk>0. or streak<1 or streak>3 or dy>=20.:continue
+        ref=O[ei0];pe=-1;lim=day_end[ei0]
+        if ei0+45<lim:lim=ei0+45
+        for j in range(ei0,lim+1):
+            if j>ei0 and bst[j]!=0:break
+            if L[j]<=ref-10.:break
+            if H[j]>=ref+18.:pe=j;break
+        if pe<0 or pe+1>=len(O) or D[pe+1]!=dd:continue
+        ei=pe+1
+        if occ[ei]!=0:continue
+        zend=day_end[ei];nb=nextbst[ei]
+        if nb>ei and nb<zend:zend=nb
+        ep=O[ei];mfe=0.;xp=C[zend];xi=zend
+        for j in range(ei,zend+1):
+            if j>ei and bst[j]!=0:xp=O[j];xi=j;break
+            if j>ei and d15_m[j]!=0 and d15_m[j]!=1:xp=O[j];xi=j;break
+            floor=-10.
+            if mfe>=15.:floor=0.
+            if mfe>=25.:floor=5.
+            sl=ep+floor
+            if O[j]<=sl:xp=O[j];xi=j;break
+            if L[j]<=sl:xp=sl;xi=j;break
+            if H[j]>=ep+20.:xp=ep+20.;xi=j;break
+            if H[j]-ep>mfe:mfe=H[j]-ep
+        pp=xp-ep;addW[ww]+=pp;addD[dd]+=pp;used[dd]+=1;busy=xi
+        while bj<len(bext) and bext[bj]<=xi:
+            if bext[bj]>lastproc:
+                if bp[bj]<=0:streak+=1
+                else:streak=0
+            bj+=1
+        if pp<=0:streak+=1
+        else:streak=0
+        if xi>lastproc:lastproc=xi
+        oe[n]=ei;ox[n]=xi;op[n]=pp;od[n]=1;n+=1
+    return oe[:n],ox[:n],op[:n],od[:n]
+
+def _r7_morning_candidates(ctx):
+    T,O,H,L,C,N,D=ctx['T'],ctx['O'],ctx['H'],ctx['L'],ctx['C'],ctx['N'],ctx['D'];d15_m=ctx['d15_m']
+    x=pd.DataFrame({'timestamp':pd.to_datetime(T),'open':O,'high':H,'low':L,'close':C,'idx':np.arange(N)})
+    x['date']=x.timestamp.dt.normalize(); mm=x.timestamp.dt.hour*60+x.timestamp.dt.minute; x['bucket']=((mm-555)//5).astype(int)
+    b5=x.groupby(['date','bucket'],sort=False).agg(last_idx=('idx','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),cnt=('idx','size')).reset_index()
+    b5['ema5']=b5.groupby('date',sort=False).close.transform(lambda z:z.ewm(span=5,adjust=False).mean())
+    b5['ema10']=b5.groupby('date',sort=False).close.transform(lambda z:z.ewm(span=10,adjust=False).mean())
+    rng=b5.high-b5.low; b5['body']=(b5.close-b5.open).abs()/rng.replace(0,np.nan)
+    lastday=x.groupby('date',sort=False).close.last(); b5['prev_close']=b5.date.map(lastday.shift(1))
+    b5['oc945']=b5.date.map(b5[b5.bucket<=5].groupby('date',sort=False).close.last())
+    b5['ph1']=b5.groupby('date',sort=False).high.shift(1); b5['pl1']=b5.groupby('date',sort=False).low.shift(1)
+    cand=[]
+    for r in b5.itertuples(index=False):
+        if r.bucket<6 or r.bucket>65 or pd.isna(r.prev_close):continue
+        ei=int(r.last_idx)+1
+        if ei>=N or D[ei]!=D[int(r.last_idx)]:continue
+        if r.oc945>r.prev_close:d=1
+        elif r.oc945<r.prev_close:d=-1
+        else:continue
+        if d==1 and not (r.ema5>r.ema10):continue
+        if d==-1 and not (r.ema5<r.ema10):continue
+        if d15_m[ei]!=0 and d15_m[ei]!=d:continue
+        ph1=float(r.ph1) if pd.notna(r.ph1) else np.nan; pl1=float(r.pl1) if pd.notna(r.pl1) else np.nan
+        # 14-column shape retained for the compiled simulator; unused fields are zero.
+        cand.append((ei,int(r.last_idx),d,int(r.bucket),float(r.close),0.,0.,ph1,pl1,0.,0.,0.,0.,float(r.body)))
+    return np.array(cand,float) if cand else np.empty((0,14),float)
+
+def _r7_morning_layer(df,base,ctx):
+    state=_r7_state(df,base,False); ca=_r7_morning_candidates(ctx)
+    oe,ox,op,od=_r7_morning_sim_fast(ctx['O'],ctx['H'],ctx['L'],ctx['C'],ctx['D'],ctx['W'],state['occ'].astype(np.int8),state['bst'],ctx['day_end'],ctx['d15_m'],state['live_day'],state['live_week'],state['bext'],state['bp'],state['nextbst'],ca)
+    z=_r7_simple_layer('R7_7_MORNING_PROOF_LONG',ctx['T'],oe,ox,op,od)
+    return z
+
+def _r7_combine(base,*layers):
+    parts=[base]
+    for z in layers:
+        if z is not None and len(z):parts.append(z[['Module','Direction','Entry_Time','Exit_Time','Points']].copy())
+    q=pd.concat(parts,ignore_index=True);q.Entry_Time=pd.to_datetime(q.Entry_Time);q.Exit_Time=pd.to_datetime(q.Exit_Time)
+    return q.sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+
+
 def run_engine(args):
     init(args.nifty)
     p=r4_core_params(args.start,args.end)
@@ -1103,62 +1937,59 @@ def run_engine(args):
     sdf=DF[(DF.timestamp>=pd.Timestamp(args.start))&(DF.timestamp<pd.Timestamp(args.end))].copy().reset_index(drop=True)
     swing=run_r3_swing(sdf,core)
     feat=_build_repair_features(sdf)
-
-    base=pd.concat([core[['Entry_Time','Exit_Time','Points']].assign(Module='CORE'),
-                    swing[['Entry_Time','Exit_Time','Points']].assign(Module='SWING')],ignore_index=True)
+    base=pd.concat([core[['Entry_Time','Exit_Time','Points']].assign(Module='CORE'),swing[['Entry_Time','Exit_Time','Points']].assign(Module='SWING')],ignore_index=True)
     repair_a=_run_week_repair(sdf,base,feat,_r3_repair_a_config(),'REPAIR_A')
     with_a=pd.concat([base,repair_a[['Entry_Time','Exit_Time','Points','Module']]],ignore_index=True)
     repair_b=_run_week_repair(sdf,with_a,feat,_r3_repair_b_config(),'REPAIR_B')
-    realized=_combine_generated(core,swing,repair_a,repair_b)
-    itm3_segments=_itm3_execution_segments(sdf,core,swing,profit_roll=70.0,max_sessions=2)
-
-    cm=_closed_metrics(core.sort_values(['Exit_Time','Entry_Time']).Points)
-    sm=_closed_metrics(swing.sort_values(['Exit_Time','Entry_Time']).Points)
-    am=_closed_metrics(repair_a.sort_values(['Exit_Time','Entry_Time']).Points) if len(repair_a) else _closed_metrics([])
-    bm=_closed_metrics(repair_b.sort_values(['Exit_Time','Entry_Time']).Points) if len(repair_b) else _closed_metrics([])
-    fm=_closed_metrics(realized.Points)
-    years=[]
-    yy=pd.to_datetime(realized.Exit_Time).dt.year
+    r4=_combine_generated(core,swing,repair_a,repair_b)
+    F=_r5_session_features(sdf,r4)
+    sigA=_r5_build_signal(F,4,40.0,0.60,0.0,11)
+    A=_r5_sim_breakout(F,*sigA,F['occ'],F['start'],F['live_day'],F['live_week'],20.,45.,70.,20.,4,999.,10.,10.,20.,'R5_A')
+    occA,stA,dayA,weekA,drA,wrA=_r5_add_layer(F,A,F['occ'],F['start'],F['live_day'],F['live_week'],F['day_real'],F['week_real'])
+    sigB=_r5_build_signal(F,3,0.0,0.30,0.0,15);sigB=_r6_filter_b_midday_entries(F,sigB)
+    B5=_r5_sim_breakout(F,*sigB,occA,stA,dayA,weekA,999.,999.,999.,20.,2,20.,1.,1.,20.,'R5_B')
+    occB,stB,dayB,weekB,drB,wrB=_r5_add_layer(F,B5,occA,stA,dayA,weekA,drA,wrA)
+    tr,cross,br5=_r5_c2145_arrays(F);C15=_r5_sim_c2145(F,occB,stB,tr,cross,br5)
+    r6=_r7_detail_from_r6(core,swing,repair_a,repair_b,A,B5,C15)
+    ctx=_r7_common_context(sdf);ctx['df']=sdf
+    # R7 sequence: each layer sees only prior generated current-run trades.
+    r71=_r7_layer1(sdf,r6,ctx); b71=_r7_combine(r6,r71)
+    r72=_r7_layer2(sdf,b71,ctx); b72=_r7_combine(b71,r72)
+    cfg3={'expansion_min':2.10,'body_min':.55,'week_min':-5.,'week_max':0.,'loss_streak_min':2,'loss_streak_max':3,'target':35.,'max_per_day':1,'exclude_1':(765,840),'exclude_2':(870,930),'be_mfe':15.,'lock_mfe':30.,'lock_points':5.}
+    r73=_r7_sim_micro(ctx,b72,cfg3,'R7_3_STRONG_MICRO');b73=_r7_combine(b72,r73)
+    cfg4={'expansion_min':2.05,'body_min':.60,'breakout_extension_min':.05,'week_min':-10.,'week_max':0.,'loss_streak_min':0,'loss_streak_max':2,'target':40.,'max_per_day':1,'exclude_1':(765,840),'exclude_2':(870,930),'be_mfe':15.,'lock_mfe':30.,'lock_points':5.}
+    r74=_r7_sim_micro(ctx,b73,cfg4,'R7_4_STRONG_CHILD');b74=_r7_combine(b73,r74)
+    cfg5={'expansion_min':1.90,'expansion_max':2.05,'body_min':.60,'breakout_extension_min':.10,'prior3_compression_max':1.50,'week_min':-10.,'week_max':0.,'loss_streak_min':0,'loss_streak_max':2,'target':40.,'max_per_day':1,'exclude_1':(765,840),'exclude_2':(870,930),'be_mfe':15.,'lock_mfe':30.,'lock_points':5.}
+    r75=_r7_sim_micro(ctx,b74,cfg5,'R7_5_INTERMEDIATE');b75=_r7_combine(b74,r75)
+    cfg6={'expansion_min':1.90,'body_min':.55,'ema_gap_norm_min':.10,'breakout_extension_min':.10,'min_since_1p9':20,'week_min':-10.,'week_max':0.,'loss_streak_min':1,'loss_streak_max':3,'target':25.,'max_per_day':2,'exclude_1':(765,840),'exclude_2':(870,930),'be_mfe':15.,'lock_mfe':30.,'lock_points':5.}
+    r76=_r7_sim_micro(ctx,b75,cfg6,'R7_6_SECOND_CHILD');b76=_r7_combine(b75,r76)
+    r77=_r7_morning_layer(sdf,b76,ctx);b77=_r7_combine(b76,r77)
+    cfg8={'include_start_min':840,'include_end_min':870,'expansion_min':1.60,'body_min':.55,'ema_gap_norm_min':.15,'breakout_extension_min':.03,'week_min':-10.,'week_max':0.,'loss_streak_min':0,'loss_streak_max':2,'target':20.,'max_per_day':1,'be_mfe':15.,'lock_mfe':30.,'lock_points':5.}
+    r78=_r7_sim_micro(ctx,b77,cfg8,'R7_8_LATE_CHILD');final=_r7_combine(b77,r78)
+    fm=_r7_metrics_detail(final);counts=_r7_period_counts(sdf,final)
+    yearly=[];yy=pd.to_datetime(final.Exit_Time).dt.year
     for y in sorted(yy.unique()):
-        z=realized[yy==y]
-        years.append({'year':int(y),'points':float(z.Points.sum()),'trades':int(len(z))})
-    counts=_period_counts(sdf,realized)
-    risk_diag=_loss_duration_diagnostics([core[['Entry_Time','Exit_Time','Points']],
-                                          swing[['Entry_Time','Exit_Time','Points']],
-                                          repair_a[['Entry_Time','Exit_Time','Points']] if len(repair_a) else None,
-                                          repair_b[['Entry_Time','Exit_Time','Points']] if len(repair_b) else None])
-    roll_summary={'segments':int(len(itm3_segments)),'roll_boundaries':int((itm3_segments.Exit_Reason!='PARENT_EXIT').sum()) if len(itm3_segments) else 0,
-                  'profit_rolls':int((itm3_segments.Exit_Reason=='PROFIT_ROLL_70').sum()) if len(itm3_segments) else 0,
-                  'age_rolls':int((itm3_segments.Exit_Reason=='AGE_ROLL_2D').sum()) if len(itm3_segments) else 0,
-                  'max_child_sessions':int(itm3_segments.Trading_Sessions.max()) if len(itm3_segments) else 0}
-    summary={'core':cm,'swing':sm,'repair_a':am,'repair_b':bm,'combined':fm,
-             'daily':counts['daily'],'weekly':counts['weekly'],'yearly':years,
-             'risk_duration':risk_diag,'itm3_execution_segments':roll_summary}
-    print(json.dumps(summary,indent=2))
-
+        z=final[yy==y];yearly.append({'year':int(y),'points':float(z.Points.sum()),'trades':int(len(z))})
+    layers={}
+    for name,z in [('R7_1_IMPULSE',r71),('R7_2_QUIET_PARENT',r72),('R7_3_STRONG_MICRO',r73),('R7_4_STRONG_CHILD',r74),('R7_5_INTERMEDIATE',r75),('R7_6_SECOND_CHILD',r76),('R7_7_MORNING_PROOF_LONG',r77),('R7_8_LATE_CHILD',r78)]:
+        layers[name]=_r7_metrics_detail(z) if z is not None and len(z) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.}
+    summary={'engine':'NIFTY_R7_RULES_ONLY_ITM3_SHORT_CHILDREN','combined':fm,'daily':counts['daily'],'weekly':counts['weekly'],'yearly':yearly,'r7_layers':layers,'rules':R7_RULES,
+             'integrity':{'raw_minute_only':True,'historical_trade_rows_embedded':False,'historical_timestamps_embedded':False,'precomputed_pnl_embedded':False,'date_specific_fixes':False,'completed_bar_next_minute_fills':True,'minimum_paid_initial_stop_points':10.0}}
+    print(json.dumps(summary,indent=2,default=str))
     if args.out:
         from pathlib import Path
         out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
-        # Generated outputs only; nothing historical is embedded in this engine file.
-        core.to_csv(out/'core_generated.csv',index=False)
-        swing.to_csv(out/'swing_generated.csv',index=False)
-        repair_a.to_csv(out/'repair_a_generated.csv',index=False)
-        repair_b.to_csv(out/'repair_b_generated.csv',index=False)
-        realized.to_csv(out/'all_generated.csv',index=False)
-        itm3_segments.to_csv(out/'itm3_execution_segments_generated.csv',index=False)
-        masters.to_csv(out/'core_masters_generated.csv',index=False)
-        (out/'summary.json').write_text(json.dumps(summary,indent=2))
+        core.to_csv(out/'core_generated.csv',index=False);swing.to_csv(out/'swing_generated.csv',index=False);repair_a.to_csv(out/'repair_a_generated.csv',index=False);repair_b.to_csv(out/'repair_b_generated.csv',index=False);A.to_csv(out/'r5_layer_a_generated.csv',index=False);B5.to_csv(out/'r5_layer_b_generated.csv',index=False);C15.to_csv(out/'r5_layer_c2145_generated.csv',index=False)
+        for name,z in [('r7_1_impulse_generated.csv',r71),('r7_2_quiet_parent_generated.csv',r72),('r7_3_strong_micro_generated.csv',r73),('r7_4_strong_child_generated.csv',r74),('r7_5_intermediate_generated.csv',r75),('r7_6_second_child_generated.csv',r76),('r7_7_morning_proof_long_generated.csv',r77),('r7_8_late_child_generated.csv',r78)]: z.to_csv(out/name,index=False)
+        final.to_csv(out/'all_generated.csv',index=False);(out/'summary.json').write_text(json.dumps(summary,indent=2,default=str))
 
 
 def main():
     import argparse
-    ap=argparse.ArgumentParser(description='Standalone rules-only NIFTY R4 engine (stable GitHub filename)')
+    ap=argparse.ArgumentParser(description='Standalone rules-only NIFTY R7 engine')
     ap.add_argument('--nifty',required=True,help='raw NIFTY 1-minute CSV or ZIP')
-    ap.add_argument('--start',required=True)
-    ap.add_argument('--end',required=True,help='exclusive end')
-    ap.add_argument('--out',default=None,help='optional directory for generated runtime reports')
+    ap.add_argument('--start',required=True);ap.add_argument('--end',required=True,help='exclusive end')
+    ap.add_argument('--out',default=None,help='optional output directory for generated runtime reports')
     run_engine(ap.parse_args())
 
-
-if __name__=='__main__':
-    main()
+if __name__=='__main__': main()

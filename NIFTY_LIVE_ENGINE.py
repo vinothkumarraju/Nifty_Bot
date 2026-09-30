@@ -41,6 +41,7 @@ For local/offline testing:
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import subprocess
@@ -226,16 +227,33 @@ def run_rules_engine(cache: pd.DataFrame, runtime_dir: Path) -> tuple[dict[str, 
 
 
 def telegram(text: str, disabled: bool = False) -> bool:
-    if disabled: return False
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip(); chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    """Send a formatted Telegram message. Telegram has no arbitrary text colors,
+    so the runner uses HTML emphasis plus colored emoji status markers.
+    """
+    if disabled:
+        print(text)
+        return False
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat:
         print("TELEGRAM not configured; message follows:\n" + text)
         return False
     try:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat, "text": text, "disable_web_page_preview": True}, timeout=20)
-        r.raise_for_status(); return True
+        r = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        return True
     except Exception as e:
-        print(f"Telegram error: {e}", file=sys.stderr); return False
+        print(f"Telegram error: {e}", file=sys.stderr)
+        return False
 
 
 def trade_key(row: pd.Series) -> str:
@@ -246,15 +264,162 @@ def fmt_points(x: float | None) -> str:
     return "—" if x is None or pd.isna(x) else f"{x:+.2f}"
 
 
-def status_message(now: pd.Timestamp, spot: float | None, parent: dict[str, Any], day_pnl: float, week_pnl: float, streak: int, trades_today: int) -> str:
+def pnl_icon(x: float | None) -> str:
+    if x is None or pd.isna(x):
+        return "⚪"
+    if x > 0:
+        return "🟢"
+    if x < 0:
+        return "🔴"
+    return "⚪"
+
+
+def direction_meta(direction: str) -> tuple[str, str, str]:
+    d = str(direction or "").upper()
+    if d == "LONG" or d == "BULL":
+        return "🟢", "LONG", "BUY ITM3 CE"
+    if d == "SHORT" or d == "BEAR":
+        return "🔴", "SHORT", "BUY ITM3 PE"
+    return "🟡", d or "UNKNOWN", "WAIT"
+
+
+def module_target_points(module: str) -> float | None:
+    # Fixed-harvest R7 child modules only. Older parent/runner modules are
+    # managed by their own trailing / state exits and intentionally show no
+    # synthetic target in Telegram.
+    targets = {
+        "R7_3_STRONG_MICRO": 35.0,
+        "R7_4_STRONG_CHILD": 40.0,
+        "R7_5_INTERMEDIATE": 40.0,
+        "R7_6_SECOND_CHILD": 25.0,
+        "R7_7_MORNING_PROOF_LONG": 20.0,
+        "R7_8_LATE_CHILD": 20.0,
+    }
+    return targets.get(str(module))
+
+
+def cache_price_at(cache: pd.DataFrame, when: pd.Timestamp, field: str = "open") -> float | None:
+    if cache is None or len(cache) == 0:
+        return None
+    t = pd.Timestamp(when)
+    q = cache.loc[cache.timestamp == t, field] if field in cache.columns else pd.Series(dtype=float)
+    if len(q):
+        try:
+            return float(q.iloc[-1])
+        except Exception:
+            return None
+    return None
+
+
+def price_plan(entry_spot: float | None, direction: str, module: str) -> tuple[str, str]:
+    if entry_spot is None or pd.isna(entry_spot):
+        return "—", "module-managed"
+    d = str(direction).upper()
+    sign = 1.0 if d == "LONG" else -1.0
+    stop = entry_spot - sign * 10.0
+    target_pts = module_target_points(module)
+    target = entry_spot + sign * target_pts if target_pts is not None else None
+    return f"{stop:.2f}", (f"{target:.2f} (+{target_pts:.0f})" if target is not None else "module-managed / trailing")
+
+
+def status_message(
+    now: pd.Timestamp,
+    spot: float | None,
+    spot_ts: str | None,
+    parent: dict[str, Any],
+    day_pnl: float,
+    week_pnl: float,
+    streak: int,
+    trades_today: int,
+    active_count: int = 0,
+) -> str:
     spot_text = "—" if spot is None or pd.isna(spot) else f"{spot:.2f}"
+    parent_dir = str(parent.get("direction", "UNKNOWN"))
+    picon, _, _ = direction_meta(parent_dir)
+    parent_gap = float(parent.get("gap", 0.0) or 0.0)
+    ts_text = "—"
+    if spot_ts:
+        try:
+            ts_text = pd.Timestamp(spot_ts).strftime("%H:%M")
+        except Exception:
+            ts_text = str(spot_ts)
+    active_line = f"\n🔔 <b>Active edge rows:</b> {active_count}" if active_count else ""
     return (
-        f"NIFTY R7 • {now.strftime('%d-%b %H:%M IST')}\n"
-        f"Spot: {spot_text}\n"
-        f"Parent 30m: {parent.get('direction','UNKNOWN')} | gap {parent.get('gap',0):.2f}\n"
-        f"Today: {fmt_points(day_pnl)} pts | Week: {fmt_points(week_pnl)} pts | Loss streak: {streak}\n"
-        f"Generated trades today: {trades_today}\n"
-        f"Live entry cutoff: 15:15 IST | R7 rules-only"
+        f"🔵 <b>NIFTY R7 LIVE STATUS</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🕒 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n"
+        f"📍 <b>Spot:</b> <code>{spot_text}</code>  <i>(1m {html.escape(ts_text)})</i>\n"
+        f"{picon} <b>30m Parent:</b> {html.escape(parent_dir)}  |  EMA gap <code>{parent_gap:.2f}</code>\n"
+        f"{pnl_icon(day_pnl)} <b>Today:</b> <code>{fmt_points(day_pnl)}</code> pts\n"
+        f"{pnl_icon(week_pnl)} <b>This week:</b> <code>{fmt_points(week_pnl)}</code> pts\n"
+        f"🧯 <b>Current loss streak:</b> {streak}\n"
+        f"🧾 <b>Generated trades today:</b> {trades_today}"
+        f"{active_line}\n"
+        f"⏰ <b>New-entry cutoff:</b> 15:15 IST\n"
+        f"🧠 <b>Engine:</b> R7 rules-only · completed candles → next-1m fill"
+    )
+
+
+def entry_message(
+    row: pd.Series,
+    cache: pd.DataFrame,
+    parent: dict[str, Any],
+    day_pnl: float,
+    week_pnl: float,
+    streak: int,
+) -> str:
+    module = str(row.get("Module", "?"))
+    direction = str(row.get("Direction", "?"))
+    icon, dlabel, option_action = direction_meta(direction)
+    et = pd.Timestamp(row.Entry_Time)
+    entry_spot = cache_price_at(cache, et, "open")
+    stop_text, target_text = price_plan(entry_spot, direction, module)
+    entry_text = "—" if entry_spot is None else f"{entry_spot:.2f}"
+    parent_dir = str(parent.get("direction", "UNKNOWN"))
+    return (
+        f"🚨 <b>R7 NEW TRADE / SIGNAL</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{icon} <b>{html.escape(dlabel)}</b>  →  <b>{html.escape(option_action)}</b>\n"
+        f"🧩 <b>Module:</b> <code>{html.escape(module)}</code>\n"
+        f"🕒 <b>Entry:</b> {et.strftime('%d-%b %H:%M IST')}\n"
+        f"📍 <b>Spot entry:</b> <code>{entry_text}</code>\n"
+        f"🛡️ <b>Initial spot SL:</b> <code>{stop_text}</code>  (~10 pts risk)\n"
+        f"🎯 <b>Spot target/management:</b> <code>{html.escape(target_text)}</code>\n"
+        f"📈 <b>30m parent:</b> {html.escape(parent_dir)}\n"
+        f"{pnl_icon(day_pnl)} <b>Day:</b> {fmt_points(day_pnl)}  |  "
+        f"{pnl_icon(week_pnl)} <b>Week:</b> {fmt_points(week_pnl)}\n"
+        f"🧯 <b>Loss streak:</b> {streak}\n"
+        f"✅ <i>Completed-candle signal; entry is next regular 1-minute open.</i>"
+    )
+
+
+def exit_message(row: pd.Series, cache: pd.DataFrame, day_pnl: float, week_pnl: float) -> str:
+    module = str(row.get("Module", "?"))
+    direction = str(row.get("Direction", "?"))
+    _, dlabel, option_action = direction_meta(direction)
+    points = float(row.get("Points", 0.0))
+    xt = pd.Timestamp(row.Exit_Time)
+    exit_spot = cache_price_at(cache, xt, "open")
+    exit_text = "—" if exit_spot is None else f"{exit_spot:.2f}"
+    if points > 0:
+        header = "✅ <b>R7 PROFIT EXIT</b>"
+        result_icon = "🟢"
+    elif points <= -9.5:
+        header = "🛑 <b>R7 STOP / LOSS EXIT</b>"
+        result_icon = "🔴"
+    else:
+        header = "⚪ <b>R7 FLAT / PROTECTED EXIT</b>"
+        result_icon = "⚪"
+    return (
+        f"{header}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🧩 <b>Module:</b> <code>{html.escape(module)}</code>\n"
+        f"↔️ <b>Side:</b> {html.escape(dlabel)} / {html.escape(option_action)}\n"
+        f"🕒 <b>Exit:</b> {xt.strftime('%d-%b %H:%M IST')}\n"
+        f"📍 <b>Exit spot:</b> <code>{exit_text}</code>\n"
+        f"{result_icon} <b>Realized spot points:</b> <code>{points:+.2f}</code>\n"
+        f"{pnl_icon(day_pnl)} <b>Day:</b> {fmt_points(day_pnl)}  |  "
+        f"{pnl_icon(week_pnl)} <b>Week:</b> {fmt_points(week_pnl)}"
     )
 
 
@@ -272,15 +437,41 @@ def main() -> None:
     if 9*60 <= m < 9*60+5:
         key = now.strftime("%Y-%m-%d") + "|0900"
         if key not in state["special"]:
-            telegram(f"NIFTY R7 scheduler alive • {now.strftime('%d-%b-%Y 09:00 IST')}\nPre-session monitoring started.", args.no_telegram)
+            telegram(
+                f"🟦 <b>NIFTY R7 BOT ONLINE</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"🕘 <b>{now.strftime('%d-%b-%Y 09:00 IST')}</b>\n"
+                f"📡 Pre-session monitoring started\n"
+                f"🧠 R7 rules-only engine ready\n"
+                f"⏳ Next reports: 09:10 pre-session · 09:15 market start",
+                args.no_telegram,
+            )
             state["special"].append(key)
     if 9*60+8 <= m < 9*60+15:
         key = now.strftime("%Y-%m-%d") + "|0910"
         if key not in state["special"]:
             lp, pc = fetch_fast_price() if not args.offline_csv else (None, None)
             chg = (lp-pc) if lp is not None and pc is not None else None
-            text = f"NIFTY R7 pre-session • {now.strftime('%d-%b %H:%M IST')}\nYahoo last: {lp:.2f}" if lp is not None else f"NIFTY R7 pre-session • {now.strftime('%d-%b %H:%M IST')}\nYahoo last price unavailable"
-            if chg is not None: text += f"\nVs prev close: {chg:+.2f}"
+            if lp is not None:
+                pct = (chg / pc * 100.0) if chg is not None and pc not in (None, 0) else None
+                gap_icon = pnl_icon(chg)
+                text = (
+                    f"🟣 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    f"🕘 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n"
+                    f"📍 <b>Yahoo last:</b> <code>{lp:.2f}</code>\n"
+                    f"📌 <b>Previous close:</b> <code>{pc:.2f}</code>" if pc is not None else
+                    f"🟣 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n🕘 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n📍 <b>Yahoo last:</b> <code>{lp:.2f}</code>"
+                )
+                if chg is not None:
+                    text += f"\n{gap_icon} <b>Gap:</b> <code>{chg:+.2f}</code> pts"
+                    if pct is not None:
+                        text += f"  (<code>{pct:+.2f}%</code>)"
+                text += "\n⏳ Waiting for completed 09:15+ market candles before any R7 signal."
+            else:
+                text = (
+                    f"🟡 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    f"🕘 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n"
+                    f"⚠️ Yahoo last price unavailable. The bot will retry on the next scheduled run."
+                )
             telegram(text, args.no_telegram); state["special"].append(key)
 
     if args.offline_csv:
@@ -300,6 +491,16 @@ def main() -> None:
             summary, trades = run_rules_engine(cache, Path(td))
     except Exception as e:
         runtime_error = str(e); print(runtime_error, file=sys.stderr)
+        err_key = now.strftime("%Y-%m-%dT%H") + "|ENGINE_ERROR"
+        if err_key not in state.get("special", []):
+            telegram(
+                f"🚨 <b>NIFTY R7 ENGINE WARNING</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
+                f"⚠️ <code>{html.escape(runtime_error[-1200:])}</code>\n"
+                f"🔁 The next scheduled run will retry automatically.",
+                args.no_telegram,
+            )
+            state.setdefault("special", []).append(err_key)
 
     day_pnl = week_pnl = 0.0; streak = 0; recent = []; active = []
     if len(trades):
@@ -316,12 +517,12 @@ def main() -> None:
             if pd.Timestamp(r.Entry_Time).normalize() != tday: continue
             k = trade_key(r); em = pd.Timestamp(r.Entry_Time).hour*60 + pd.Timestamp(r.Entry_Time).minute
             if k not in seen_e and em <= LIVE_ENTRY_CUTOFF_MIN:
-                telegram(f"R7 SIGNAL / ENTRY\n{r.get('Module','?')} {r.get('Direction','?')}\nEntry: {pd.Timestamp(r.Entry_Time).strftime('%H:%M')} IST\nSpot engine child initiated\nInitial risk: >=10 pts", args.no_telegram)
+                telegram(entry_message(r, cache, parent, day_pnl, week_pnl, streak), args.no_telegram)
                 seen_e.add(k)
             xk = k + "|" + pd.Timestamp(r.Exit_Time).isoformat()
             # A row ending exactly at current data edge may be a live/open row forced by replay; don't announce it as exit yet.
             if latest is not None and pd.Timestamp(r.Exit_Time) < pd.Timestamp(latest) and xk not in seen_x:
-                telegram(f"R7 EXIT\n{r.get('Module','?')} {r.get('Direction','?')}\nExit: {pd.Timestamp(r.Exit_Time).strftime('%H:%M')} IST\nSpot points: {float(r.Points):+.2f}", args.no_telegram)
+                telegram(exit_message(r, cache, day_pnl, week_pnl), args.no_telegram)
                 seen_x.add(xk)
         state["seen_entries"] = list(seen_e)[-1500:]; state["seen_exits"] = list(seen_x)[-1500:]
         if latest is not None:
@@ -331,18 +532,31 @@ def main() -> None:
     if 9*60+15 <= m < 9*60+20:
         key = now.strftime("%Y-%m-%d") + "|0915"
         if key not in state["special"]:
-            telegram(status_message(now, spot, parent, day_pnl, week_pnl, streak, int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0), args.no_telegram); state["special"].append(key)
+            telegram(status_message(now, spot, spot_ts, parent, day_pnl, week_pnl, streak, int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0, len(active)), args.no_telegram); state["special"].append(key)
     if is_heartbeat_slot(now):
         slot = now.floor(f"{HEARTBEAT_MINUTES}min").strftime("%Y-%m-%dT%H:%M")
         if slot not in state["heartbeats"]:
-            telegram(status_message(now, spot, parent, day_pnl, week_pnl, streak, int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0), args.no_telegram); state["heartbeats"].append(slot)
+            telegram(status_message(now, spot, spot_ts, parent, day_pnl, week_pnl, streak, int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0, len(active)), args.no_telegram); state["heartbeats"].append(slot)
     # 15:30 run reports completed 15:29 spot; no new entries are permitted here.
     if 15*60+29 <= m < 15*60+40:
         key = now.strftime("%Y-%m-%d") + "|CLOSE1529"
         if key not in state["special"]:
             close1529 = today_rows.loc[(today_rows.timestamp.dt.hour==15)&(today_rows.timestamp.dt.minute==29), "close"] if len(today_rows) else pd.Series(dtype=float)
             c = float(close1529.iloc[-1]) if len(close1529) else spot
-            telegram(f"NIFTY R7 close report • {now.strftime('%d-%b')}\n15:29 spot: {c:.2f}" if c is not None else "NIFTY R7 close report\n15:29 spot unavailable", args.no_telegram)
+            trades_today = int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0
+            ctext = "—" if c is None else f"{c:.2f}"
+            telegram(
+                f"🌙 <b>NIFTY R7 END-OF-DAY REPORT</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"📅 <b>{now.strftime('%d-%b-%Y')}</b>\n"
+                f"📍 <b>15:29 spot:</b> <code>{ctext}</code>\n"
+                f"{pnl_icon(day_pnl)} <b>Day:</b> <code>{fmt_points(day_pnl)}</code> pts\n"
+                f"{pnl_icon(week_pnl)} <b>Week:</b> <code>{fmt_points(week_pnl)}</code> pts\n"
+                f"🧾 <b>Trades today:</b> {trades_today}\n"
+                f"🧯 <b>Loss streak:</b> {streak}\n"
+                f"📈 <b>30m parent:</b> {html.escape(str(parent.get('direction','UNKNOWN')))}\n"
+                f"🔒 New live entries were disabled after 15:15 IST.",
+                args.no_telegram,
+            )
             state["special"].append(key)
 
     # Keep state arrays bounded.
