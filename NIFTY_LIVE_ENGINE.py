@@ -42,6 +42,7 @@ Telegram
 - Every newly detected strategy ENTRY.
 - Every newly detected strategy EXIT / stop.
 - Every 30-minute status during the live session.
+- Strategy state is polled continuously (default every 60 seconds) while a live GitHub job is running, so SIGNAL/ENTRY/EXIT alerts are not delayed to the status cadence.
 - CAS provisional/final price notices.
 - CAS option-management notices for open strategy positions.
 - 15:40 final F&O-management notice.
@@ -76,6 +77,8 @@ NIFTY_LIVE_CACHE               default runtime/nifty_live_minutes.csv
 NIFTY_CACHE_DAYS               default 90
 NIFTY_ALERT_LOOKBACK_MIN       default 15
 NIFTY_STATUS_MINUTES           default 30
+NIFTY_POLL_SECONDS             default 60 (continuous live mode)
+NIFTY_CONTINUOUS_UNTIL         optional HH:MM stop time for the current GitHub live segment
 NIFTY_CAS_HARVEST_TRIGGER      default 70
 NIFTY_EVENT_LOG                default logs/nifty_trade_events.csv
 NIFTY_STATUS_LOG               default logs/nifty_status_30m.csv
@@ -1655,6 +1658,69 @@ def run_once(args) -> int:
     return 0
 
 
+
+def _parse_hhmm(raw: str) -> dtime:
+    raw = str(raw).strip()
+    hh, mm = raw.split(":", 1)
+    return dtime(int(hh), int(mm))
+
+
+def run_continuous(args) -> int:
+    """Keep the live engine hot and poll for newly completed bars.
+
+    GitHub schedule is used only to START a live segment. Once running, this loop
+    replays the live snapshot every poll interval so accepted SIGNAL / ENTRY / EXIT
+    events are alerted as soon as the data provider exposes the completed bar.
+    """
+    poll = max(20, int(args.poll_seconds))
+    until = _parse_hhmm(args.until)
+    last_error_alert_at = None
+
+    print(json.dumps({
+        "mode": "CONTINUOUS_LIVE",
+        "poll_seconds": poll,
+        "until_ist": until.strftime("%H:%M"),
+    }, indent=2))
+
+    while True:
+        now = now_ist()
+        if now.timetz().replace(tzinfo=None) > until:
+            print(f"Continuous segment finished at {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            return 0
+
+        started = time.monotonic()
+        try:
+            run_once(args)
+        except Exception as exc:
+            # A transient provider/network failure must not kill the whole live day.
+            try:
+                elog = Path(getattr(args, "error_log", "logs/nifty_errors.csv"))
+                append_csv_row(elog, {
+                    "logged_at_ist": str(now_ist()),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                })
+            except Exception:
+                pass
+
+            now_err = now_ist()
+            should_alert = (
+                last_error_alert_at is None
+                or (now_err - last_error_alert_at) >= pd.Timedelta(minutes=5)
+            )
+            if should_alert:
+                telegram_send(
+                    f"🚨 NIFTY LIVE POLL ERROR — runner will keep retrying\n"
+                    f"{type(exc).__name__}: {exc}"
+                )
+                last_error_alert_at = now_err
+            print(f"LIVE POLL ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+        elapsed = time.monotonic() - started
+        sleep_for = max(1.0, poll - elapsed)
+        time.sleep(sleep_for)
+
+
 def build_args():
     ap = argparse.ArgumentParser(
         description="NIFTY live-only GitHub + Telegram + CAS runner"
@@ -1711,12 +1777,31 @@ def build_args():
         type=int,
         default=int(os.getenv("NIFTY_STATUS_MINUTES", "30")),
     )
+    ap.add_argument(
+        "--continuous",
+        action="store_true",
+        default=env_bool("NIFTY_CONTINUOUS", False),
+        help="Keep polling live data inside one GitHub job for near-immediate alerts.",
+    )
+    ap.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=int(os.getenv("NIFTY_POLL_SECONDS", "60")),
+        help="Seconds between live polls in --continuous mode (minimum 20).",
+    )
+    ap.add_argument(
+        "--until",
+        default=os.getenv("NIFTY_CONTINUOUS_UNTIL", "15:41"),
+        help="IST HH:MM when the current continuous live segment should stop.",
+    )
     return ap.parse_args()
 
 
 if __name__ == "__main__":
     args = build_args()
     try:
+        if args.continuous:
+            raise SystemExit(run_continuous(args))
         raise SystemExit(run_once(args))
     except Exception as exc:
         try:
