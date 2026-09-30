@@ -27,7 +27,7 @@ concurrency:
 jobs:
   nifty-live:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     env:
       TZ: Asia/Kolkata
       NIFTY_SYMBOL: ^NSEI
@@ -44,20 +44,42 @@ jobs:
         with:
           fetch-depth: 0
 
+      # IMPORTANT: no pip cache here. setup-python cache requires a dependency
+      # file to exist before this step and was the cause of the previous error.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
+
+      - name: Show repository files
+        run: |
+          echo "Repository root:"
+          pwd
+          ls -la
 
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && pip install -r requirements.txt
-
-      - name: Validate required files
+        shell: bash
         run: |
-          test -f NIFTY_R7_RULES_ONLY_ENGINE.py
-          test -f NIFTY_LIVE_ENGINE.py
-          test -f requirements.txt
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            echo "Installing from requirements.txt"
+            python -m pip install -r requirements.txt
+          else
+            echo "requirements.txt not found; installing required packages directly"
+            python -m pip install \
+              'numpy>=1.26,<3' \
+              'pandas>=2.2,<3' \
+              'yfinance>=0.2.54,<1' \
+              'requests>=2.32,<3' \
+              'numba>=0.60,<1'
+          fi
+
+      - name: Validate required engine files
+        shell: bash
+        run: |
+          test -f NIFTY_R7_RULES_ONLY_ENGINE.py || { echo "ERROR: NIFTY_R7_RULES_ONLY_ENGINE.py missing"; exit 1; }
+          test -f NIFTY_LIVE_ENGINE.py || { echo "ERROR: NIFTY_LIVE_ENGINE.py missing"; exit 1; }
+          echo "Required R7 files found."
 
       - name: Run NIFTY R7 live check
         env:
@@ -67,10 +89,13 @@ jobs:
 
       - name: Persist cache, state and viewer data
         if: always()
+        shell: bash
         run: |
           git config user.name "nifty-live-bot"
           git config user.email "nifty-live-bot@users.noreply.github.com"
-          git add live_cache.csv live_state.json live_status.json live_trades.csv 2>/dev/null || true
+          for f in live_cache.csv live_state.json live_status.json live_trades.csv; do
+            [ -f "$f" ] && git add "$f"
+          done
           if ! git diff --cached --quiet; then
             git commit -m "chore: update NIFTY live state [skip ci]"
             git pull --rebase origin "${GITHUB_REF_NAME}" || true
