@@ -31,7 +31,7 @@ jobs:
     env:
       TZ: Asia/Kolkata
       NIFTY_SYMBOL: ^NSEI
-      R7_ENGINE: NIFTY_R7_RULES_ONLY_ENGINE.py
+      NIFTY_ENGINE: NIFTY_RULES_ONLY_ENGINE.py
       LIVE_CACHE: live_cache.csv
       LIVE_STATE: live_state.json
       LIVE_STATUS: live_status.json
@@ -77,7 +77,7 @@ jobs:
       - name: Validate required engine files
         shell: bash
         run: |
-          test -f NIFTY_R7_RULES_ONLY_ENGINE.py || { echo "ERROR: NIFTY_RULES_ONLY_ENGINE.py missing"; exit 1; }
+          test -f NIFTY_RULES_ONLY_ENGINE.py || { echo "ERROR: NIFTY_RULES_ONLY_ENGINE.py missing"; exit 1; }
           test -f NIFTY_LIVE_ENGINE.py || { echo "ERROR: NIFTY_LIVE_ENGINE.py missing"; exit 1; }
           echo "Required R7 files found."
 
