@@ -1,6 +1,8 @@
 {
   "initialized": true,
-  "seen_signals": [],
+  "seen_signals": [
+    "R4|REPAIR_A|(19, 29)/(3, 13)/(3, 13)|SHORT|2026-09-30T14:30:00|22642.7500"
+  ],
   "seen_entries": [
     "R4|CORE|normal|SHORT|2026-09-22T10:45:00|23382.6992",
     "R4|SWING|PRIOR|SHORT|2026-09-24T09:18:00|23235.4004",
@@ -10,7 +12,8 @@
     "R4|SWING|MICROCHAIN|SHORT|2026-09-25T13:17:00|23042.2500",
     "R4|CORE|normal|SHORT|2026-09-28T09:45:00|22857.4004",
     "R4|REPAIR_A|(19, 29)/(3, 13)/(3, 13)|SHORT|2026-09-28T13:05:00|22821.1992",
-    "R4|REPAIR_B|(19, 29)/(3, 13)/(5, 10)|SHORT|2026-09-28T14:20:00|22795.4492"
+    "R4|REPAIR_B|(19, 29)/(3, 13)/(5, 10)|SHORT|2026-09-28T14:20:00|22795.4492",
+    "R4|REPAIR_A|(19, 29)/(3, 13)/(3, 13)|SHORT|2026-09-30T14:30:00|22642.7500"
   ],
   "seen_exits": [
     "R4|CORE|normal|SHORT|2026-09-22T10:45:00|23382.6992|2026-09-22T11:14:00|STOP",
@@ -21,17 +24,30 @@
     "R4|SWING|MICROCHAIN|SHORT|2026-09-25T13:17:00|23042.2500|2026-09-25T13:47:00|STOP",
     "R4|CORE|normal|SHORT|2026-09-28T09:45:00|22857.4004|2026-09-28T09:46:00|STOP",
     "R4|REPAIR_A|(19, 29)/(3, 13)/(3, 13)|SHORT|2026-09-28T13:05:00|22821.1992|2026-09-28T13:10:00|STOP",
-    "R4|REPAIR_B|(19, 29)/(3, 13)/(5, 10)|SHORT|2026-09-28T14:20:00|22795.4492|2026-09-28T14:21:00|STOP"
+    "R4|REPAIR_B|(19, 29)/(3, 13)/(5, 10)|SHORT|2026-09-28T14:20:00|22795.4492|2026-09-28T14:21:00|STOP",
+    "R4|REPAIR_A|(19, 29)/(3, 13)/(3, 13)|SHORT|2026-09-30T14:30:00|22642.7500|2026-09-30T14:48:00|STOP"
   ],
-  "last_status_slot": "2026-09-30 13:15",
+  "last_status_slot": "2026-09-30 15:15",
   "last_data_warning": null,
   "boot_notice_date": "2026-09-30",
   "presession_notice_date": "2026-09-30",
   "session_start_notice_date": "2026-09-30",
-  "last_strategy_bar": "2026-09-30 13:38:00",
-  "last_live_quote_time": "2026-09-30 13:38:00",
-  "last_live_quote": 22763.650390625,
+  "last_strategy_bar": "2026-09-30 15:15:00",
+  "last_live_quote_time": "2026-09-30 15:29:00",
+  "last_live_quote": 22620.44921875,
   "engine_sha256": "2b73c7b13b0ab025b16f0c368814f4f40a844b71d133af143fe47bffeb3b2c24",
-  "updated_at_ist": "2026-09-30 13:39:46.019419+05:30",
-  "phase": "SPOT_STRATEGY_ACTIVE"
+  "updated_at_ist": "2026-09-30 15:40:57.684830+05:30",
+  "phase": "FNO_CLOSE",
+  "cas_latest_spot": 22620.44921875,
+  "cas_latest_quote_time": "2026-09-30 15:29:00",
+  "cas_price_notices": [
+    "2026-09-30:provisional:2026-09-30 15:29:00",
+    "2026-09-30:final:2026-09-30 15:29:00"
+  ],
+  "cas_management_notices": [],
+  "itm3_children": {},
+  "cas_final_spot": 22620.44921875,
+  "cas_final_quote_time": "2026-09-30 15:29:00",
+  "cas_final_date": "2026-09-30",
+  "fno_close_notice_date": "2026-09-30"
 }

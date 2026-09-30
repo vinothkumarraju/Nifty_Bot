@@ -1,0 +1,4 @@
+logged_at_ist,event,spot,quote_time,detail
+2026-09-30 15:30:57.682697+05:30,CAS_PROVISIONAL_PRICE,22620.44921875,2026-09-30 15:29:00,strategy spot entries frozen; option management only.
+2026-09-30 15:35:57.683755+05:30,CAS_FINAL_PRICE,22620.44921875,2026-09-30 15:29:00,strategy spot entries frozen; option management only.
+2026-09-30 15:40:57.684830+05:30,FNO_CLOSE_1540,22620.44921875,2026-09-30 15:29:00,Open strategy positions=0
