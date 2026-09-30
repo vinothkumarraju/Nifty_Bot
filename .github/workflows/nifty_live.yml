@@ -1,219 +1,80 @@
-name: NIFTY Live Engine
+name: nifty-live
 
 on:
   workflow_dispatch:
   schedule:
-    # Two long-lived live segments. Once started, each segment polls every minute.
-    # GitHub schedules may be delayed; 11:57 is intentionally ahead of the midday handoff.
-    - cron: "0 9 * * 1-5"
-      timezone: "Asia/Kolkata"
-    - cron: "57 11 * * 1-5"
-      timezone: "Asia/Kolkata"
+    # India Standard Time = UTC +05:30
+    # 09:00 IST scheduler/pre-session start
+    - cron: '30 3 * * 1-5'
+    # 09:10 IST pre-session price report
+    - cron: '40 3 * * 1-5'
+    # Check every 5 minutes from 09:15 IST through 09:25 IST
+    - cron: '45-55/5 3 * * 1-5'
+    # Check every 5 minutes from 09:30 IST through 14:25 IST
+    - cron: '*/5 4-8 * * 1-5'
+    # Check every 5 minutes from 14:30 IST through 15:15 IST
+    - cron: '0-45/5 9 * * 1-5'
+    # 15:30 IST close/report run; reports completed 15:29 spot
+    - cron: '0 10 * * 1-5'
 
 permissions:
   contents: write
 
 concurrency:
-  group: nifty-live-engine
+  group: nifty-live
   cancel-in-progress: false
 
 jobs:
   nifty-live:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
-
+    timeout-minutes: 10
     env:
       TZ: Asia/Kolkata
-
-      # Stable filenames. Keep these names unchanged when a new research version is promoted.
-      NIFTY_ENGINE_PATH: NIFTY_RULES_ONLY_ENGINE.py
-      NIFTY_LIVE_RUNNER_PATH: NIFTY_LIVE_ENGINE.py
-      NIFTY_PROVIDER: yahoo
-
-      # Session schedule consumed by the live runner.
-      NIFTY_BOOT_TIME: "09:00"
-      NIFTY_PRESESSION_TIME: "09:10"
-      NIFTY_STRATEGY_START_TIME: "09:15"
-      NIFTY_STRATEGY_LAST_TIME: "15:15"
-      NIFTY_CAS_PROVISIONAL_TIME: "15:29"
-      NIFTY_CAS_FINAL_TIME: "15:35"
-      NIFTY_FNO_CLOSE_TIME: "15:40"
-
-      # Persistent live state/cache and logs.
-      NIFTY_STATE_PATH: runtime/nifty_live_state.json
-      NIFTY_LIVE_CACHE: runtime/nifty_live_minutes.csv
-      NIFTY_CACHE_DAYS: "90"
-      NIFTY_RUNTIME_DIR: runtime
-
-      NIFTY_EVENT_LOG: logs/nifty_trade_events.csv
-      NIFTY_STATUS_LOG: logs/nifty_status_30m.csv
-      NIFTY_CAS_LOG: logs/nifty_cas_management.csv
-      NIFTY_ERROR_LOG: logs/nifty_errors.csv
-      NIFTY_EXCEL_REPORT: reports/NIFTY_LIVE_Trade_Report.xlsx
-
-      # Event detection + Telegram cadence.
-      NIFTY_ALERT_LOOKBACK_MIN: "45"
-      NIFTY_STATUS_MINUTES: "30"
-      # Immediate-event mode: keep live job hot and poll every completed minute.
-      NIFTY_POLL_SECONDS: "60"
-
-      # CAS/F&O live-management default.
-      NIFTY_CAS_HARVEST_TRIGGER: "70"
-
-      # Required repository secrets.
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NIFTY_SYMBOL: ^NSEI
+      R7_ENGINE: NIFTY_R7_RULES_ONLY_ENGINE.py
+      LIVE_CACHE: live_cache.csv
+      LIVE_STATE: live_state.json
+      LIVE_STATUS: live_status.json
+      LIVE_TRADES: live_trades.csv
+      MIN_WARMUP_SESSIONS: '5'
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: true
-
-      - name: Show run clock
-        shell: bash
-        run: |
-          echo "UTC: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          echo "IST: $(TZ=Asia/Kolkata date +'%Y-%m-%d %H:%M:%S %Z')"
-          echo "Branch: ${{ github.ref_name }}"
-
-      - name: Gate to weekday 09:00-15:40 IST
-        id: market_window
-        shell: bash
-        run: |
-          NOW_IST="$(TZ=Asia/Kolkata date +'%H%M')"
-          DOW="$(TZ=Asia/Kolkata date +'%u')"
-          RUN=false
-          if [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ] && \
-             [ "$NOW_IST" -ge 0900 ] && [ "$NOW_IST" -le 1540 ]; then
-            RUN=true
-          fi
-          echo "run=$RUN" >> "$GITHUB_OUTPUT"
-
-      - name: Verify and stage stable GitHub files
-        if: steps.market_window.outputs.run == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Repository root contents:"
-          ls -la
-
-          stage_file() {
-            local name="$1"
-            if [ -f "$name" ]; then
-              echo "Found $name in repository root."
-              return 0
-            fi
-
-            local found
-            found="$(find . -maxdepth 4 -type f -name "$name" -not -path './.git/*' -print -quit)"
-            if [ -n "$found" ]; then
-              echo "Found $name at $found; staging a root copy for this run."
-              cp "$found" "$name"
-              return 0
-            fi
-
-            echo "::error file=$name::Required file $name is not committed anywhere in this repository."
-            echo "Upload/commit $name to the repository root (recommended) and rerun."
-            exit 1
-          }
-
-          stage_file "$NIFTY_ENGINE_PATH"
-          stage_file "$NIFTY_LIVE_RUNNER_PATH"
-
-          test -s "$NIFTY_ENGINE_PATH"
-          test -s "$NIFTY_LIVE_RUNNER_PATH"
-          sha256sum "$NIFTY_ENGINE_PATH" "$NIFTY_LIVE_RUNNER_PATH"
 
       - name: Set up Python
-        if: steps.market_window.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.11'
+          cache: pip
 
       - name: Install dependencies
-        if: steps.market_window.outputs.run == 'true'
-        run: |
-          python -m pip install --upgrade pip
-          pip install numpy pandas requests yfinance xlsxwriter
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
 
-      - name: Compile engines
-        if: steps.market_window.outputs.run == 'true'
+      - name: Validate required files
         run: |
-          python -m py_compile "$NIFTY_ENGINE_PATH" "$NIFTY_LIVE_RUNNER_PATH"
+          test -f NIFTY_R7_RULES_ONLY_ENGINE.py
+          test -f NIFTY_LIVE_ENGINE.py
+          test -f requirements.txt
 
-      - name: Verify continuous live-runner interface
-        if: steps.market_window.outputs.run == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          HELP_TEXT="$(python "$NIFTY_LIVE_RUNNER_PATH" --help)"
-          echo "$HELP_TEXT"
-          grep -q -- "--continuous" <<< "$HELP_TEXT" || { echo "::error::Old NIFTY_LIVE_ENGINE.py: --continuous is missing. Replace the repo file with the current fixed runner."; exit 1; }
-          grep -q -- "--poll-seconds" <<< "$HELP_TEXT" || { echo "::error::Old NIFTY_LIVE_ENGINE.py: --poll-seconds is missing."; exit 1; }
-          grep -q -- "--until" <<< "$HELP_TEXT" || { echo "::error::Old NIFTY_LIVE_ENGINE.py: --until is missing."; exit 1; }
-          echo "Continuous live-runner interface: PASS"
+      - name: Run NIFTY R7 live check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python NIFTY_LIVE_ENGINE.py
 
-      - name: Choose continuous live segment end
-        id: segment
-        if: steps.market_window.outputs.run == 'true'
-        shell: bash
+      - name: Persist cache, state and viewer data
+        if: always()
         run: |
-          NOW_IST="$(TZ=Asia/Kolkata date +'%H%M')"
-          # Morning job stays alive through 12:15. The 11:57 trigger queues behind it
-          # because concurrency is serialized, then continues the afternoon to 15:41.
-          if [ "$NOW_IST" -lt 1215 ]; then
-            STOP_TIME="12:15"
-          else
-            STOP_TIME="15:41"
-          fi
-          echo "stop_time=$STOP_TIME" >> "$GITHUB_OUTPUT"
-          echo "Continuous NIFTY live segment will run until $STOP_TIME IST"
-
-      - name: Run continuous NIFTY live engine and immediate Telegram alerts
-        if: steps.market_window.outputs.run == 'true'
-        run: |
-          python "$NIFTY_LIVE_RUNNER_PATH" \
-            --engine "$NIFTY_ENGINE_PATH" \
-            --provider "$NIFTY_PROVIDER" \
-            --state "$NIFTY_STATE_PATH" \
-            --cache "$NIFTY_LIVE_CACHE" \
-            --event-log "$NIFTY_EVENT_LOG" \
-            --status-log "$NIFTY_STATUS_LOG" \
-            --cas-log "$NIFTY_CAS_LOG" \
-            --error-log "$NIFTY_ERROR_LOG" \
-            --excel-report "$NIFTY_EXCEL_REPORT" \
-            --alert-lookback-min "$NIFTY_ALERT_LOOKBACK_MIN" \
-            --status-minutes "$NIFTY_STATUS_MINUTES" \
-            --continuous \
-            --poll-seconds "$NIFTY_POLL_SECONDS" \
-            --until "${{ steps.segment.outputs.stop_time }}"
-
-      - name: Persist live cache, state, logs and Excel report
-        if: steps.market_window.outputs.run == 'true' && always()
-        shell: bash
-        run: |
-          set -e
           git config user.name "nifty-live-bot"
           git config user.email "nifty-live-bot@users.noreply.github.com"
-
-          mkdir -p runtime logs reports
-          git add runtime/ logs/ reports/ || true
-
-          if git diff --cached --quiet; then
+          git add live_cache.csv live_state.json live_status.json live_trades.csv 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update NIFTY live state [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}" || true
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          else
             echo "No live-state changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Update NIFTY live state [skip ci]"
-          git pull --rebase origin "${{ github.ref_name }}" || true
-          git push origin "HEAD:${{ github.ref_name }}"
-
-      - name: Show latest live state
-        if: steps.market_window.outputs.run == 'true' && always()
-        shell: bash
-        run: |
-          if [ -f "$NIFTY_STATE_PATH" ]; then
-            cat "$NIFTY_STATE_PATH"
           fi
