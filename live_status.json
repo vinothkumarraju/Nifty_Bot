@@ -1,11 +1,11 @@
 {
-  "updated_at_ist": "2026-10-01T14:23:07.433575+05:30",
+  "updated_at_ist": "2026-10-01T14:33:40.502460+05:30",
   "phase": "live-trading",
   "symbol": "^NSEI",
   "source": "Yahoo Finance 1m + rolling repository cache",
   "spot": {
-    "last_completed_1m": 22285.75,
-    "timestamp": "2026-10-01 14:22:00"
+    "last_completed_1m": 22331.69921875,
+    "timestamp": "2026-10-01 14:32:00"
   },
   "parent_30m": {
     "direction": "BEAR",
@@ -32,15 +32,15 @@
     "win_rate": 42.857142857142854
   },
   "checkpoint": {
-    "name": "R8-14 locked / exact replay",
+    "name": "R7-8 verified",
     "period": "2020-01-01 to 2026-05-15",
-    "points": 42371.65,
-    "pf": 3.43843858533484,
+    "points": 41124.25,
+    "pf": 3.3902151959431044,
     "dd": 261.45,
-    "trades": 2716,
-    "green_weeks": 224,
-    "red_weeks": 70,
-    "flat_weeks": 39
+    "trades": 2631,
+    "green_weeks": 217,
+    "red_weeks": 76,
+    "flat_weeks": 40
   },
   "recent_trades": [
     {
