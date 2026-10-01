@@ -3,19 +3,12 @@ name: nifty-live
 on:
   workflow_dispatch:
   schedule:
-    # India Standard Time = UTC +05:30
-    # 09:00 IST scheduler/pre-session start
-    - cron: '30 3 * * 1-5'
-    # 09:10 IST pre-session price report
-    - cron: '40 3 * * 1-5'
-    # Check every 5 minutes from 09:15 IST through 09:25 IST
-    - cron: '45-55/5 3 * * 1-5'
-    # Check every 5 minutes from 09:30 IST through 14:25 IST
-    - cron: '*/5 4-8 * * 1-5'
-    # Check every 5 minutes from 14:30 IST through 15:15 IST
-    - cron: '0-45/5 9 * * 1-5'
-    # 15:30 IST close/report run; reports completed 15:29 spot
-    - cron: '0 10 * * 1-5'
+    # GitHub cron is UTC. Run every 5 minutes from 09:00 through 15:40 IST.
+    # Repeating slots make 09:00 / 09:10 / 09:15 alerts self-healing if one
+    # scheduled invocation is delayed or dropped by GitHub.
+    - cron: '30-55/5 3 * * 1-5'   # 09:00-09:25 IST
+    - cron: '*/5 4-9 * * 1-5'     # 09:30-15:25 IST
+    - cron: '0-10/5 10 * * 1-5'   # 15:30-15:40 IST
 
 permissions:
   contents: write
@@ -28,6 +21,7 @@ jobs:
   nifty-live:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     env:
       TZ: Asia/Kolkata
       NIFTY_SYMBOL: ^NSEI
@@ -37,6 +31,8 @@ jobs:
       LIVE_STATUS: live_status.json
       LIVE_TRADES: live_trades.csv
       MIN_WARMUP_SESSIONS: '5'
+      NIFTY_TRIGGER: ${{ github.event_name }}
+      NIFTY_GITHUB_RUN_ID: ${{ github.run_id }}
 
     steps:
       - name: Checkout repository
@@ -44,8 +40,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # IMPORTANT: no pip cache here. setup-python cache requires a dependency
-      # file to exist before this step and was the cause of the previous error.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -53,33 +47,51 @@ jobs:
 
       - name: Show repository files
         run: |
-          echo "Repository root:"
-          pwd
+          echo "Repository root: $(pwd)"
           ls -la
+
+      - name: Validate required files
+        shell: bash
+        run: |
+          test -f NIFTY_RULES_ONLY_ENGINE.py || { echo "::error::NIFTY_RULES_ONLY_ENGINE.py missing from repository root"; exit 1; }
+          test -f NIFTY_LIVE_ENGINE.py || { echo "::error::NIFTY_LIVE_ENGINE.py missing from repository root"; exit 1; }
+          echo "Required live files found."
 
       - name: Install dependencies
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            echo "Installing from requirements.txt"
-            python -m pip install -r requirements.txt
-          else
-            echo "requirements.txt not found; installing required packages directly"
-            python -m pip install \
-              'numpy>=1.26,<3' \
-              'pandas>=2.2,<3' \
-              'yfinance>=0.2.54,<1' \
-              'requests>=2.32,<3' \
-              'numba>=0.60,<1'
-          fi
+          python -m pip install \
+            'numpy>=1.26,<3' \
+            'pandas>=2.2,<3' \
+            'yfinance>=0.2.54,<1' \
+            'requests>=2.32,<3' \
+            'numba>=0.60,<1'
 
-      - name: Validate required engine files
+      - name: Validate Telegram configuration
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         shell: bash
         run: |
-          test -f NIFTY_RULES_ONLY_ENGINE.py || { echo "ERROR: NIFTY_RULES_ONLY_ENGINE.py missing"; exit 1; }
-          test -f NIFTY_LIVE_ENGINE.py || { echo "ERROR: NIFTY_LIVE_ENGINE.py missing"; exit 1; }
-          echo "Required R7 files found."
+          test -n "$TELEGRAM_BOT_TOKEN" || { echo "::error::Missing GitHub secret TELEGRAM_BOT_TOKEN"; exit 1; }
+          test -n "$TELEGRAM_CHAT_ID" || { echo "::error::Missing GitHub secret TELEGRAM_CHAT_ID"; exit 1; }
+          python - <<'PY2'
+          import os, requests, sys
+          token = os.environ['TELEGRAM_BOT_TOKEN']
+          chat = os.environ['TELEGRAM_CHAT_ID']
+          r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=20)
+          if not r.ok or not r.json().get('ok'):
+              print('::error::Telegram bot token validation failed')
+              print(r.text[:500])
+              sys.exit(1)
+          r = requests.get(f"https://api.telegram.org/bot{token}/getChat", params={'chat_id': chat}, timeout=20)
+          if not r.ok or not r.json().get('ok'):
+              print('::error::Telegram chat ID validation failed. Open the bot in Telegram, press Start, and verify TELEGRAM_CHAT_ID.')
+              print(r.text[:500])
+              sys.exit(1)
+          print('Telegram bot token and chat ID validated.')
+          PY2
 
       - name: Run NIFTY R7 live check
         env:
