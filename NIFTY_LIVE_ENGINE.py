@@ -173,10 +173,19 @@ def session_phase(now: pd.Timestamp) -> str:
     return "closed"
 
 
-def is_heartbeat_slot(now: pd.Timestamp) -> bool:
+def heartbeat_slot_key(now: pd.Timestamp) -> str | None:
+    """Return the latest 30-minute status slot anchored at 09:15 IST.
+
+    This is delay-tolerant: if GitHub starts a scheduled job a few minutes late,
+    the latest unsent slot is still delivered instead of being lost forever.
+    """
     m = now.hour * 60 + now.minute
     start = 9 * 60 + 15
-    return start <= m <= LIVE_ENTRY_CUTOFF_MIN and ((m - start) % HEARTBEAT_MINUTES) < 5
+    if m < start or m > LIVE_ENTRY_CUTOFF_MIN:
+        return None
+    slot_min = start + ((m - start) // HEARTBEAT_MINUTES) * HEARTBEAT_MINUTES
+    hh, mm = divmod(slot_min, 60)
+    return f"{now.strftime('%Y-%m-%d')}|HB{hh:02d}{mm:02d}"
 
 
 def parent_30m(cache: pd.DataFrame) -> dict[str, Any]:
@@ -254,6 +263,33 @@ def telegram(text: str, disabled: bool = False) -> bool:
     except Exception as e:
         print(f"Telegram error: {e}", file=sys.stderr)
         return False
+
+
+def normalize_state_schema(state: Any) -> dict[str, Any]:
+    """Migrate any older live_state.json shape without crashing the runner."""
+    if not isinstance(state, dict):
+        state = {}
+    for key in ("seen_entries", "seen_exits", "heartbeats", "special"):
+        if not isinstance(state.get(key), list):
+            state[key] = []
+    return state
+
+
+def delivered(ok: bool, no_telegram: bool) -> bool:
+    """Offline tests count as delivered; live runs count only real Telegram success."""
+    return bool(ok or no_telegram)
+
+
+def send_once(state: dict[str, Any], bucket: str, key: str, text: str, no_telegram: bool) -> bool:
+    """Send and de-duplicate only after confirmed delivery. Failed sends are retried."""
+    arr = state.setdefault(bucket, [])
+    if key in arr:
+        return True
+    ok = telegram(text, no_telegram)
+    if delivered(ok, no_telegram):
+        arr.append(key)
+        return True
+    return False
 
 
 def trade_key(row: pd.Series) -> str:
@@ -430,54 +466,89 @@ def main() -> None:
     ap.add_argument("--no-telegram", action="store_true")
     args = ap.parse_args()
     now = now_ist(args.now); phase = session_phase(now)
-    state = load_json(STATE_FILE, {"seen_entries": [], "seen_exits": [], "heartbeats": [], "special": []})
+    state = normalize_state_schema(load_json(STATE_FILE, {}))
 
-    # Pre-session special alerts do not require a complete minute cache.
+    # A manual GitHub Actions run always sends one explicit Telegram test message.
+    # This makes Telegram verification immediate even when run outside a heartbeat slot.
+    if os.getenv("NIFTY_TRIGGER", "").strip() == "workflow_dispatch" and not args.no_telegram:
+        telegram(
+            f"🧪 <b>NIFTY R7 MANUAL TEST</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"✅ GitHub Actions reached the live runner\n"
+            f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
+            f"📡 Telegram connection is working."
+        )
+
+    # Delay-tolerant scheduled alerts. GitHub cron is not guaranteed to start at
+    # the exact minute, so each special report has a catch-up window.
     m = now.hour * 60 + now.minute
-    if 9*60 <= m < 9*60+5:
-        key = now.strftime("%Y-%m-%d") + "|0900"
-        if key not in state["special"]:
-            telegram(
-                f"🟦 <b>NIFTY R7 BOT ONLINE</b>\n━━━━━━━━━━━━━━━━━━\n"
-                f"🕘 <b>{now.strftime('%d-%b-%Y 09:00 IST')}</b>\n"
-                f"📡 Pre-session monitoring started\n"
-                f"🧠 R7 rules-only engine ready\n"
-                f"⏳ Next reports: 09:10 pre-session · 09:15 market start",
-                args.no_telegram,
-            )
-            state["special"].append(key)
-    if 9*60+8 <= m < 9*60+15:
-        key = now.strftime("%Y-%m-%d") + "|0910"
+    date_key = now.strftime("%Y-%m-%d")
+
+    # Scheduled 09:00 BOT ONLINE. Catch up through 09:29 if GitHub started late.
+    if 9*60 <= m < 9*60+30:
+        key = date_key + "|0900"
+        online_text = (
+            f"🟦 <b>NIFTY R7 BOT ONLINE</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🕘 <b>Scheduled:</b> 09:00 IST\n"
+            f"▶️ <b>Actual wake:</b> {now.strftime('%d-%b-%Y %H:%M IST')}\n"
+            f"📡 Pre-session monitoring active\n"
+            f"🧠 R7 rules-only engine ready\n"
+            f"⏳ Next: 09:10 pre-session · 09:15 market start"
+        )
+        send_once(state, "special", key, online_text, args.no_telegram)
+
+    # Scheduled 09:10 Yahoo last/previous-close report. Catch up through 09:29.
+    if 9*60+10 <= m < 9*60+30:
+        key = date_key + "|0910"
         if key not in state["special"]:
             lp, pc = fetch_fast_price() if not args.offline_csv else (None, None)
             chg = (lp-pc) if lp is not None and pc is not None else None
             if lp is not None:
                 pct = (chg / pc * 100.0) if chg is not None and pc not in (None, 0) else None
                 gap_icon = pnl_icon(chg)
-                text = (
+                pre_text = (
                     f"🟣 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
-                    f"🕘 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n"
-                    f"📍 <b>Yahoo last:</b> <code>{lp:.2f}</code>\n"
-                    f"📌 <b>Previous close:</b> <code>{pc:.2f}</code>" if pc is not None else
-                    f"🟣 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n🕘 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n📍 <b>Yahoo last:</b> <code>{lp:.2f}</code>"
+                    f"🕘 <b>Scheduled:</b> 09:10 IST  |  <b>Delivered:</b> {now.strftime('%H:%M IST')}\n"
+                    f"📍 <b>Yahoo latest:</b> <code>{lp:.2f}</code>"
                 )
+                if pc is not None:
+                    pre_text += f"\n📌 <b>Previous close:</b> <code>{pc:.2f}</code>"
                 if chg is not None:
-                    text += f"\n{gap_icon} <b>Gap:</b> <code>{chg:+.2f}</code> pts"
+                    pre_text += f"\n{gap_icon} <b>Gap:</b> <code>{chg:+.2f}</code> pts"
                     if pct is not None:
-                        text += f"  (<code>{pct:+.2f}%</code>)"
-                text += "\n⏳ Waiting for completed 09:15+ market candles before any R7 signal."
+                        pre_text += f"  (<code>{pct:+.2f}%</code>)"
+                pre_text += "\n⏳ R7 entries begin only after completed market candles are available."
             else:
-                text = (
+                pre_text = (
                     f"🟡 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
-                    f"🕘 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n"
-                    f"⚠️ Yahoo last price unavailable. The bot will retry on the next scheduled run."
+                    f"🕘 <b>Scheduled:</b> 09:10 IST  |  <b>Delivered:</b> {now.strftime('%H:%M IST')}\n"
+                    f"⚠️ Yahoo fast price unavailable. The next 5-minute run will retry market data."
                 )
-            telegram(text, args.no_telegram); state["special"].append(key)
+            send_once(state, "special", key, pre_text, args.no_telegram)
 
+    # Persist immediately so a later Yahoo/engine failure cannot erase successful
+    # pre-session Telegram delivery state.
+    atomic_json(STATE_FILE, state)
+
+    data_error = None
     if args.offline_csv:
         new = normalize_ohlc(pd.read_csv(args.offline_csv))
     else:
-        new = fetch_yahoo_1m()
+        try:
+            new = fetch_yahoo_1m()
+        except Exception as e:
+            data_error = f"Yahoo 1m fetch failed: {type(e).__name__}: {e}"
+            print(data_error, file=sys.stderr)
+            new = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close"])
+            err_key = date_key + "|DATA_ERROR"
+            send_once(
+                state, "special", err_key,
+                f"⚠️ <b>NIFTY LIVE DATA WARNING</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
+                f"⚠️ {html.escape(data_error[-800:])}\n"
+                f"🔁 Existing cache will be used if available; next run retries Yahoo automatically.",
+                args.no_telegram,
+            )
+            atomic_json(STATE_FILE, state)
     cache = combine_cache(new, now)
     today_naive = now.tz_localize(None).normalize()
     today_rows = cache[cache.timestamp.dt.normalize() == today_naive] if len(cache) else cache
@@ -492,15 +563,14 @@ def main() -> None:
     except Exception as e:
         runtime_error = str(e); print(runtime_error, file=sys.stderr)
         err_key = now.strftime("%Y-%m-%dT%H") + "|ENGINE_ERROR"
-        if err_key not in state.get("special", []):
-            telegram(
-                f"🚨 <b>NIFTY R7 ENGINE WARNING</b>\n━━━━━━━━━━━━━━━━━━\n"
-                f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
-                f"⚠️ <code>{html.escape(runtime_error[-1200:])}</code>\n"
-                f"🔁 The next scheduled run will retry automatically.",
-                args.no_telegram,
-            )
-            state.setdefault("special", []).append(err_key)
+        send_once(
+            state, "special", err_key,
+            f"🚨 <b>NIFTY R7 ENGINE WARNING</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
+            f"⚠️ <code>{html.escape(runtime_error[-1200:])}</code>\n"
+            f"🔁 The next scheduled run will retry automatically.",
+            args.no_telegram,
+        )
 
     day_pnl = week_pnl = 0.0; streak = 0; recent = []; active = []
     if len(trades):
@@ -517,35 +587,49 @@ def main() -> None:
             if pd.Timestamp(r.Entry_Time).normalize() != tday: continue
             k = trade_key(r); em = pd.Timestamp(r.Entry_Time).hour*60 + pd.Timestamp(r.Entry_Time).minute
             if k not in seen_e and em <= LIVE_ENTRY_CUTOFF_MIN:
-                telegram(entry_message(r, cache, parent, day_pnl, week_pnl, streak), args.no_telegram)
-                seen_e.add(k)
+                ok = telegram(entry_message(r, cache, parent, day_pnl, week_pnl, streak), args.no_telegram)
+                if delivered(ok, args.no_telegram):
+                    seen_e.add(k)
             xk = k + "|" + pd.Timestamp(r.Exit_Time).isoformat()
             # A row ending exactly at current data edge may be a live/open row forced by replay; don't announce it as exit yet.
             if latest is not None and pd.Timestamp(r.Exit_Time) < pd.Timestamp(latest) and xk not in seen_x:
-                telegram(exit_message(r, cache, day_pnl, week_pnl), args.no_telegram)
-                seen_x.add(xk)
+                ok = telegram(exit_message(r, cache, day_pnl, week_pnl), args.no_telegram)
+                if delivered(ok, args.no_telegram):
+                    seen_x.add(xk)
         state["seen_entries"] = list(seen_e)[-1500:]; state["seen_exits"] = list(seen_x)[-1500:]
         if latest is not None:
             active = trades[(trades.Entry_Time.dt.normalize()==tday) & (trades.Exit_Time==pd.Timestamp(latest))].tail(10).to_dict("records")
 
-    # 09:15 open report and 30-minute heartbeat.
-    if 9*60+15 <= m < 9*60+20:
-        key = now.strftime("%Y-%m-%d") + "|0915"
+    trades_today = int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0
+
+    # 09:15 market-open report. Catch up through 09:44 if GitHub starts late.
+    # Mark the 09:15 heartbeat slot too, preventing a duplicate status message.
+    if 9*60+15 <= m < 9*60+45:
+        key = date_key + "|0915"
         if key not in state["special"]:
-            telegram(status_message(now, spot, spot_ts, parent, day_pnl, week_pnl, streak, int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0, len(active)), args.no_telegram); state["special"].append(key)
-    if is_heartbeat_slot(now):
-        slot = now.floor(f"{HEARTBEAT_MINUTES}min").strftime("%Y-%m-%dT%H:%M")
-        if slot not in state["heartbeats"]:
-            telegram(status_message(now, spot, spot_ts, parent, day_pnl, week_pnl, streak, int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0, len(active)), args.no_telegram); state["heartbeats"].append(slot)
+            live_px, prev_px = fetch_fast_price() if not args.offline_csv else (None, None)
+            open_spot = live_px if live_px is not None else spot
+            open_text = status_message(now, open_spot, spot_ts, parent, day_pnl, week_pnl, streak, trades_today, len(active))
+            open_text = open_text.replace("🔵 <b>NIFTY R7 LIVE STATUS</b>", "🟢 <b>NIFTY R7 MARKET OPEN / LIVE START</b>", 1)
+            if send_once(state, "special", key, open_text, args.no_telegram):
+                hb0915 = date_key + "|HB0915"
+                if hb0915 not in state["heartbeats"]:
+                    state["heartbeats"].append(hb0915)
+
+    # 30-minute heartbeat/status: 09:15, 09:45, 10:15 ... 15:15.
+    hb_key = heartbeat_slot_key(now)
+    if hb_key and hb_key not in state["heartbeats"]:
+        ok = telegram(status_message(now, spot, spot_ts, parent, day_pnl, week_pnl, streak, trades_today, len(active)), args.no_telegram)
+        if delivered(ok, args.no_telegram):
+            state["heartbeats"].append(hb_key)
     # 15:30 run reports completed 15:29 spot; no new entries are permitted here.
-    if 15*60+29 <= m < 15*60+40:
-        key = now.strftime("%Y-%m-%d") + "|CLOSE1529"
+    if 15*60+29 <= m <= 15*60+40:
+        key = date_key + "|CLOSE1529"
         if key not in state["special"]:
             close1529 = today_rows.loc[(today_rows.timestamp.dt.hour==15)&(today_rows.timestamp.dt.minute==29), "close"] if len(today_rows) else pd.Series(dtype=float)
             c = float(close1529.iloc[-1]) if len(close1529) else spot
-            trades_today = int((trades.Entry_Time.dt.normalize()==today_naive).sum()) if len(trades) else 0
             ctext = "—" if c is None else f"{c:.2f}"
-            telegram(
+            eod_text = (
                 f"🌙 <b>NIFTY R7 END-OF-DAY REPORT</b>\n━━━━━━━━━━━━━━━━━━\n"
                 f"📅 <b>{now.strftime('%d-%b-%Y')}</b>\n"
                 f"📍 <b>15:29 spot:</b> <code>{ctext}</code>\n"
@@ -554,10 +638,9 @@ def main() -> None:
                 f"🧾 <b>Trades today:</b> {trades_today}\n"
                 f"🧯 <b>Loss streak:</b> {streak}\n"
                 f"📈 <b>30m parent:</b> {html.escape(str(parent.get('direction','UNKNOWN')))}\n"
-                f"🔒 New live entries were disabled after 15:15 IST.",
-                args.no_telegram,
+                f"🔒 New live entries were disabled after 15:15 IST."
             )
-            state["special"].append(key)
+            send_once(state, "special", key, eod_text, args.no_telegram)
 
     # Keep state arrays bounded.
     state["heartbeats"] = state.get("heartbeats", [])[-200:]; state["special"] = state.get("special", [])[-100:]
@@ -574,7 +657,7 @@ def main() -> None:
         "spot": {"last_completed_1m": spot, "timestamp": spot_ts}, "parent_30m": parent,
         "live": {"day_points":day_pnl,"week_points":week_pnl,"loss_streak":streak,"sessions_in_cache":int(cache.timestamp.dt.normalize().nunique()) if len(cache) else 0,"warmup_ready":bool(len(cache) and cache.timestamp.dt.normalize().nunique()>=MIN_WARMUP_SESSIONS),"entry_cutoff_ist":"15:15","active_edge_rows":active},
         "engine_replay": summary.get("combined") if summary else None,
-        "checkpoint": CHECKPOINT, "recent_trades": recent_records, "error": runtime_error,
+        "checkpoint": CHECKPOINT, "recent_trades": recent_records, "error": runtime_error or data_error,
     }
     atomic_json(STATUS_FILE, status)
     print(json.dumps(status, indent=2, default=str))

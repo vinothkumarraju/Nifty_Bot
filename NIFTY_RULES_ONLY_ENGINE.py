@@ -974,7 +974,10 @@ def _run_week_repair(df, existing, feat, cfg, module_name):
                          Signal_Time=pd.Timestamp(b5.end.iloc[q]),Parent_30m=str(feat['p30'][pi]),
                          Child_15m=str(feat['p15'][ci]),Trigger_5m=str(feat['p5'][mi])))
         attempts+=1;last_exit=xi;allow_i=xi+cfg['cool']
-    return pd.DataFrame(rows)
+    cols=["Module","Entry_Time","Exit_Time","Direction","Entry_Price","Exit_Price","Points",
+          "Exit_Reason","MFE","Day_PnL_At_Entry","Week_PnL_At_Entry","Signal_Time",
+          "Parent_30m","Child_15m","Trigger_5m"]
+    return pd.DataFrame(rows, columns=cols)
 
 
 def _r3_repair_a_config():
