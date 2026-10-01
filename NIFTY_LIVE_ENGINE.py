@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NIFTY R8 LIVE RUNNER (GitHub Actions)
+NIFTY R7 LIVE RUNNER (GitHub Actions)
 =====================================
 
 Purpose
@@ -32,6 +32,9 @@ Optional environment variables:
     LIVE_STATE=live_state.json
     LIVE_STATUS=live_status.json
     LIVE_TRADES=live_trades.csv
+    NIFTY_EVENT_LOG=logs/nifty_trade_events.csv
+    NIFTY_STATUS_LOG=logs/nifty_status_30m.csv
+    NIFTY_EXCEL_REPORT=reports/NIFTY_LIVE_Trade_Report.xlsx
     MIN_WARMUP_SESSIONS=5
 
 For local/offline testing:
@@ -61,20 +64,23 @@ CACHE_FILE = Path(os.getenv("LIVE_CACHE", "live_cache.csv"))
 STATE_FILE = Path(os.getenv("LIVE_STATE", "live_state.json"))
 STATUS_FILE = Path(os.getenv("LIVE_STATUS", "live_status.json"))
 TRADES_FILE = Path(os.getenv("LIVE_TRADES", "live_trades.csv"))
+EVENT_LOG_FILE = Path(os.getenv("NIFTY_EVENT_LOG", "logs/nifty_trade_events.csv"))
+STATUS_LOG_FILE = Path(os.getenv("NIFTY_STATUS_LOG", "logs/nifty_status_30m.csv"))
+EXCEL_REPORT_FILE = Path(os.getenv("NIFTY_EXCEL_REPORT", "reports/NIFTY_LIVE_Trade_Report.xlsx"))
 MIN_WARMUP_SESSIONS = int(os.getenv("MIN_WARMUP_SESSIONS", "5"))
 LIVE_ENTRY_CUTOFF_MIN = 15 * 60 + 15
 REGULAR_END_MIN = 15 * 60 + 30
 HEARTBEAT_MINUTES = 30
 CHECKPOINT = {
-    "name": "R8-14 locked / exact replay",
+    "name": "R7-8 verified",
     "period": "2020-01-01 to 2026-05-15",
-    "points": 42371.65,
-    "pf": 3.43843858533484,
+    "points": 41124.25,
+    "pf": 3.3902151959431044,
     "dd": 261.45,
-    "trades": 2716,
-    "green_weeks": 224,
-    "red_weeks": 70,
-    "flat_weeks": 39,
+    "trades": 2631,
+    "green_weeks": 217,
+    "red_weeks": 76,
+    "flat_weeks": 40,
 }
 
 
@@ -227,7 +233,7 @@ def run_rules_engine(cache: pd.DataFrame, runtime_dir: Path) -> tuple[dict[str, 
     cmd = [sys.executable, str(ENGINE_FILE), "--nifty", str(raw), "--start", start, "--end", end, "--out", str(runtime_dir)]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=150)
     if p.returncode != 0:
-        raise RuntimeError(f"R8 engine failed: {p.stderr[-2000:]}")
+        raise RuntimeError(f"R7 engine failed: {p.stderr[-2000:]}")
     summary = load_json(runtime_dir / "summary.json", None)
     trades = pd.read_csv(runtime_dir / "all_generated.csv") if (runtime_dir / "all_generated.csv").exists() else pd.DataFrame()
     if len(trades):
@@ -292,6 +298,253 @@ def send_once(state: dict[str, Any], bucket: str, key: str, text: str, no_telegr
     return False
 
 
+
+def _csv_upsert(path: Path, row: dict[str, Any], key_col: str) -> None:
+    """Append/update one logical record without duplicating retries."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new = pd.DataFrame([row])
+    if path.exists():
+        try:
+            old = pd.read_csv(path)
+        except Exception:
+            old = pd.DataFrame()
+        all_cols = list(dict.fromkeys([*old.columns.tolist(), *new.columns.tolist()]))
+        old = old.reindex(columns=all_cols)
+        new = new.reindex(columns=all_cols)
+        out = pd.concat([old, new], ignore_index=True)
+    else:
+        out = new
+    if key_col in out.columns:
+        out = out.drop_duplicates(subset=[key_col], keep="last")
+    out.to_csv(path, index=False)
+
+
+def _trade_event_row(event: str, row: pd.Series, cache: pd.DataFrame, now: pd.Timestamp) -> dict[str, Any]:
+    et = pd.Timestamp(row.Entry_Time)
+    xt = pd.Timestamp(row.Exit_Time)
+    module = str(row.get("Module", ""))
+    direction = str(row.get("Direction", ""))
+    base_key = trade_key(row)
+    event_key = base_key if event == "ENTRY" else base_key + "|" + xt.isoformat()
+    return {
+        "event_key": event_key,
+        "logged_at_ist": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "event": event,
+        "module": module,
+        "rule": "",
+        "direction": direction,
+        "entry_time": et.strftime("%Y-%m-%d %H:%M:%S"),
+        "entry_price": cache_price_at(cache, et, "open"),
+        "exit_time": "" if event == "ENTRY" else xt.strftime("%Y-%m-%d %H:%M:%S"),
+        "exit_price": "" if event == "ENTRY" else cache_price_at(cache, xt, "open"),
+        "points": "" if event == "ENTRY" else float(row.get("Points", 0.0)),
+        "exit_reason": "",
+    }
+
+
+def log_trade_event(event: str, row: pd.Series, cache: pd.DataFrame, now: pd.Timestamp) -> None:
+    _csv_upsert(EVENT_LOG_FILE, _trade_event_row(event, row, cache, now), "event_key")
+
+
+def _slot_display(slot_key: str) -> str:
+    try:
+        date_s, hb = slot_key.split("|HB", 1)
+        return f"{date_s} {hb[:2]}:{hb[2:]}"
+    except Exception:
+        return slot_key
+
+
+def log_status_slot(
+    slot_key: str,
+    now: pd.Timestamp,
+    spot: float | None,
+    spot_ts: str | None,
+    parent: dict[str, Any],
+    day_pnl: float,
+    week_pnl: float,
+    streak: int,
+    trades_today: int,
+    active_count: int,
+    telegram_delivered: bool,
+) -> None:
+    _csv_upsert(
+        STATUS_LOG_FILE,
+        {
+            "status_key": slot_key,
+            "scheduled_slot_ist": _slot_display(slot_key),
+            "logged_at_ist": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "spot": spot,
+            "spot_timestamp": spot_ts or "",
+            "parent_30m": str(parent.get("direction", "UNKNOWN")),
+            "ema_gap": float(parent.get("gap", 0.0) or 0.0),
+            "day_points": float(day_pnl),
+            "week_points": float(week_pnl),
+            "loss_streak": int(streak),
+            "trades_today": int(trades_today),
+            "active_edge_rows": int(active_count),
+            "telegram_delivered": bool(telegram_delivered),
+        },
+        "status_key",
+    )
+
+
+def _result_name(points: float) -> str:
+    return "POSITIVE" if points > 0 else ("NEGATIVE" if points < 0 else "FLAT")
+
+
+def _trade_report_frame(trades: pd.DataFrame, cache: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "Trade_ID", "Module", "Direction", "Entry_Time", "Exit_Time",
+        "Entry_Price", "Exit_Price", "Points", "Duration_Minutes", "Status", "Result",
+    ]
+    if trades is None or not len(trades):
+        return pd.DataFrame(columns=cols)
+    latest = pd.Timestamp(cache.timestamp.max()) if cache is not None and len(cache) else None
+    rows = []
+    q = trades.sort_values(["Entry_Time", "Exit_Time", "Module"]).reset_index(drop=True)
+    for i, r in q.iterrows():
+        et = pd.Timestamp(r.Entry_Time)
+        xt = pd.Timestamp(r.Exit_Time)
+        pts = float(r.get("Points", 0.0))
+        edge_open = latest is not None and xt == latest
+        rows.append({
+            "Trade_ID": i + 1,
+            "Module": str(r.get("Module", "")),
+            "Direction": str(r.get("Direction", "")),
+            "Entry_Time": et,
+            "Exit_Time": pd.NaT if edge_open else xt,
+            "Entry_Price": cache_price_at(cache, et, "open"),
+            "Exit_Price": np.nan if edge_open else cache_price_at(cache, xt, "open"),
+            "Points": pts,
+            "Duration_Minutes": float((xt - et).total_seconds() / 60.0),
+            "Status": "OPEN_EDGE" if edge_open else "CLOSED",
+            "Result": "OPEN" if edge_open else _result_name(pts),
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def write_live_excel_report(
+    path: Path,
+    trades: pd.DataFrame,
+    cache: pd.DataFrame,
+    now: pd.Timestamp,
+    spot: float | None,
+    parent: dict[str, Any],
+    day_pnl: float,
+    week_pnl: float,
+    streak: int,
+    runtime_error: str | None,
+) -> None:
+    """Regenerate the live workbook on every successful runner invocation."""
+    try:
+        import xlsxwriter  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError("xlsxwriter is required for NIFTY_LIVE_Trade_Report.xlsx") from e
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tdf = _trade_report_frame(trades, cache)
+    closed = tdf[tdf["Status"] == "CLOSED"].copy() if len(tdf) else pd.DataFrame(columns=tdf.columns)
+
+    if len(closed):
+        closed["Exit_Date"] = pd.to_datetime(closed["Exit_Time"]).dt.normalize()
+        daily = closed.groupby("Exit_Date", as_index=False).agg(
+            Trades=("Trade_ID", "count"), Points=("Points", "sum")
+        )
+        daily["Status"] = daily["Points"].map(_result_name)
+    else:
+        daily = pd.DataFrame(columns=["Exit_Date", "Trades", "Points", "Status"])
+
+    def aggregate_period(freq: str) -> pd.DataFrame:
+        if daily.empty:
+            return pd.DataFrame(columns=["Period", "Market_Days", "Trades", "Points", "Status"])
+        x = daily.copy()
+        dt = pd.to_datetime(x["Exit_Date"])
+        if freq == "W":
+            x["Period"] = dt - pd.to_timedelta(dt.dt.weekday, unit="D")
+        elif freq == "M":
+            x["Period"] = dt.dt.to_period("M").astype(str)
+        else:
+            x["Period"] = dt.dt.year
+        y = x.groupby("Period", as_index=False).agg(
+            Market_Days=("Exit_Date", "count"),
+            Trades=("Trades", "sum"),
+            Points=("Points", "sum"),
+        )
+        y["Status"] = y["Points"].map(_result_name)
+        return y
+
+    weekly = aggregate_period("W")
+    monthly = aggregate_period("M")
+    yearly = aggregate_period("Y")
+
+    pts = closed["Points"].to_numpy(float) if len(closed) else np.array([], dtype=float)
+    net = float(pts.sum()) if len(pts) else 0.0
+    gp = float(pts[pts > 0].sum()) if len(pts) else 0.0
+    gl = float(-pts[pts < 0].sum()) if len(pts) else 0.0
+    pf = gp / gl if gl > 0 else (float("inf") if gp > 0 else 0.0)
+    if len(pts):
+        eq = np.cumsum(pts)
+        peak = np.maximum.accumulate(np.r_[0.0, eq])[:-1]
+        dd = float(np.max(peak - eq))
+        win = float((pts > 0).mean() * 100.0)
+    else:
+        dd = win = 0.0
+
+    with pd.ExcelWriter(path, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm") as writer:
+        wb = writer.book
+        header = wb.add_format({"bold": True, "bg_color": "#102A43", "font_color": "#FFFFFF", "border": 1})
+        pos = wb.add_format({"bg_color": "#DCFCE7", "font_color": "#166534"})
+        neg = wb.add_format({"bg_color": "#FEE2E2", "font_color": "#991B1B"})
+        flat = wb.add_format({"bg_color": "#E5E7EB", "font_color": "#4B5563"})
+        kpi = wb.add_format({"bold": True, "border": 1})
+        note = wb.add_format({"text_wrap": True})
+
+        dash = wb.add_worksheet("Dashboard")
+        writer.sheets["Dashboard"] = dash
+        dash.write("A1", "NIFTY LIVE REPORT", header)
+        dashboard_rows = [
+            ("Updated IST", now.strftime("%Y-%m-%d %H:%M:%S")),
+            ("Spot", spot if spot is not None else ""),
+            ("30m Parent", str(parent.get("direction", "UNKNOWN"))),
+            ("Today Points", float(day_pnl)),
+            ("Week Points", float(week_pnl)),
+            ("Loss Streak", int(streak)),
+            ("Realized Net", net),
+            ("Profit Factor", pf if np.isfinite(pf) else "∞"),
+            ("Realized DD", dd),
+            ("Win Rate %", win),
+            ("Closed Trades", int(len(closed))),
+            ("Open Edge Rows", int((tdf["Status"] == "OPEN_EDGE").sum()) if len(tdf) else 0),
+            ("Runtime Error", runtime_error or ""),
+        ]
+        for i, (k, v) in enumerate(dashboard_rows, start=2):
+            dash.write(i - 1, 0, k, kpi)
+            dash.write(i - 1, 1, v, note if k == "Runtime Error" else None)
+        dash.set_column("A:A", 22)
+        dash.set_column("B:B", 40)
+
+        def write_df(name: str, df: pd.DataFrame) -> None:
+            df.to_excel(writer, sheet_name=name, index=False)
+            ws = writer.sheets[name]
+            for c, col in enumerate(df.columns):
+                ws.write(0, c, col, header)
+            if "Points" in df.columns and len(df):
+                pc = df.columns.get_loc("Points")
+                ws.conditional_format(1, pc, len(df), pc, {"type": "cell", "criteria": ">", "value": 0, "format": pos})
+                ws.conditional_format(1, pc, len(df), pc, {"type": "cell", "criteria": "<", "value": 0, "format": neg})
+                ws.conditional_format(1, pc, len(df), pc, {"type": "cell", "criteria": "==", "value": 0, "format": flat})
+            ws.freeze_panes(1, 0)
+            if len(df.columns):
+                ws.autofilter(0, 0, max(1, len(df)), len(df.columns) - 1)
+                ws.set_column(0, len(df.columns) - 1, 17)
+
+        write_df("Trades", tdf)
+        write_df("Daily", daily)
+        write_df("Weekly", weekly)
+        write_df("Monthly", monthly)
+        write_df("Yearly", yearly)
+
+
 def trade_key(row: pd.Series) -> str:
     return f"{row.get('Module','?')}|{row.get('Direction','?')}|{pd.Timestamp(row.Entry_Time).isoformat()}"
 
@@ -320,7 +573,7 @@ def direction_meta(direction: str) -> tuple[str, str, str]:
 
 
 def module_target_points(module: str) -> float | None:
-    # Fixed-harvest R7/R8 child modules. Older parent/runner modules are
+    # Fixed-harvest R7 child modules only. Older parent/runner modules are
     # managed by their own trailing / state exits and intentionally show no
     # synthetic target in Telegram.
     targets = {
@@ -330,16 +583,6 @@ def module_target_points(module: str) -> float | None:
         "R7_6_SECOND_CHILD": 25.0,
         "R7_7_MORNING_PROOF_LONG": 20.0,
         "R7_8_LATE_CHILD": 20.0,
-        "R8_1_REARM": 20.0,
-        "R8_2_15M_LONG_SHORT_CHILD": 20.0,
-        "R8_SHADOW_LONG": 25.0,
-        "R8_5_GAP_OR30": 20.0,
-        "R8_OPENING_DRIVE_SHORT": 100.0,
-        "R8_PULLBACK_RECLAIM_HQ": 40.0,
-        "R8_COUNTERSWING_RECLAIM": 60.0,
-        "R8_LATE_COUNTER_RECLAIM": 40.0,
-        "R8_MIDDAY_LONG_TRANSITION": 40.0,
-        "R8_LATE_LONG_TRANSITION": 40.0,
     }
     return targets.get(str(module))
 
@@ -391,7 +634,7 @@ def status_message(
             ts_text = str(spot_ts)
     active_line = f"\n🔔 <b>Active edge rows:</b> {active_count}" if active_count else ""
     return (
-        f"🔵 <b>NIFTY R8 LIVE STATUS</b>\n"
+        f"🔵 <b>NIFTY R7 LIVE STATUS</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🕒 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n"
         f"📍 <b>Spot:</b> <code>{spot_text}</code>  <i>(1m {html.escape(ts_text)})</i>\n"
@@ -402,7 +645,7 @@ def status_message(
         f"🧾 <b>Generated trades today:</b> {trades_today}"
         f"{active_line}\n"
         f"⏰ <b>New-entry cutoff:</b> 15:15 IST\n"
-        f"🧠 <b>Engine:</b> R8 rules-only · completed candles → next-1m fill"
+        f"🧠 <b>Engine:</b> R7 rules-only · completed candles → next-1m fill"
     )
 
 
@@ -423,7 +666,7 @@ def entry_message(
     entry_text = "—" if entry_spot is None else f"{entry_spot:.2f}"
     parent_dir = str(parent.get("direction", "UNKNOWN"))
     return (
-        f"🚨 <b>R8 NEW TRADE / SIGNAL</b>\n"
+        f"🚨 <b>R7 NEW TRADE / SIGNAL</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{icon} <b>{html.escape(dlabel)}</b>  →  <b>{html.escape(option_action)}</b>\n"
         f"🧩 <b>Module:</b> <code>{html.escape(module)}</code>\n"
@@ -448,13 +691,13 @@ def exit_message(row: pd.Series, cache: pd.DataFrame, day_pnl: float, week_pnl: 
     exit_spot = cache_price_at(cache, xt, "open")
     exit_text = "—" if exit_spot is None else f"{exit_spot:.2f}"
     if points > 0:
-        header = "✅ <b>R8 PROFIT EXIT</b>"
+        header = "✅ <b>R7 PROFIT EXIT</b>"
         result_icon = "🟢"
     elif points <= -9.5:
-        header = "🛑 <b>R8 STOP / LOSS EXIT</b>"
+        header = "🛑 <b>R7 STOP / LOSS EXIT</b>"
         result_icon = "🔴"
     else:
-        header = "⚪ <b>R8 FLAT / PROTECTED EXIT</b>"
+        header = "⚪ <b>R7 FLAT / PROTECTED EXIT</b>"
         result_icon = "⚪"
     return (
         f"{header}\n"
@@ -482,7 +725,7 @@ def main() -> None:
     # This makes Telegram verification immediate even when run outside a heartbeat slot.
     if os.getenv("NIFTY_TRIGGER", "").strip() == "workflow_dispatch" and not args.no_telegram:
         telegram(
-            f"🧪 <b>NIFTY R8 MANUAL TEST</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🧪 <b>NIFTY R7 MANUAL TEST</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"✅ GitHub Actions reached the live runner\n"
             f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
             f"📡 Telegram connection is working."
@@ -497,11 +740,11 @@ def main() -> None:
     if 9*60 <= m < 9*60+30:
         key = date_key + "|0900"
         online_text = (
-            f"🟦 <b>NIFTY R8 BOT ONLINE</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🟦 <b>NIFTY R7 BOT ONLINE</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"🕘 <b>Scheduled:</b> 09:00 IST\n"
             f"▶️ <b>Actual wake:</b> {now.strftime('%d-%b-%Y %H:%M IST')}\n"
             f"📡 Pre-session monitoring active\n"
-            f"🧠 R8 rules-only engine ready\n"
+            f"🧠 R7 rules-only engine ready\n"
             f"⏳ Next: 09:10 pre-session · 09:15 market start"
         )
         send_once(state, "special", key, online_text, args.no_telegram)
@@ -516,7 +759,7 @@ def main() -> None:
                 pct = (chg / pc * 100.0) if chg is not None and pc not in (None, 0) else None
                 gap_icon = pnl_icon(chg)
                 pre_text = (
-                    f"🟣 <b>NIFTY R8 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    f"🟣 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
                     f"🕘 <b>Scheduled:</b> 09:10 IST  |  <b>Delivered:</b> {now.strftime('%H:%M IST')}\n"
                     f"📍 <b>Yahoo latest:</b> <code>{lp:.2f}</code>"
                 )
@@ -526,10 +769,10 @@ def main() -> None:
                     pre_text += f"\n{gap_icon} <b>Gap:</b> <code>{chg:+.2f}</code> pts"
                     if pct is not None:
                         pre_text += f"  (<code>{pct:+.2f}%</code>)"
-                pre_text += "\n⏳ R8 entries begin only after completed market candles are available."
+                pre_text += "\n⏳ R7 entries begin only after completed market candles are available."
             else:
                 pre_text = (
-                    f"🟡 <b>NIFTY R8 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    f"🟡 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
                     f"🕘 <b>Scheduled:</b> 09:10 IST  |  <b>Delivered:</b> {now.strftime('%H:%M IST')}\n"
                     f"⚠️ Yahoo fast price unavailable. The next 5-minute run will retry market data."
                 )
@@ -568,14 +811,14 @@ def main() -> None:
 
     summary = None; trades = pd.DataFrame(); runtime_error = None
     try:
-        with tempfile.TemporaryDirectory(prefix="nifty_r8_live_") as td:
+        with tempfile.TemporaryDirectory(prefix="nifty_r7_live_") as td:
             summary, trades = run_rules_engine(cache, Path(td))
     except Exception as e:
         runtime_error = str(e); print(runtime_error, file=sys.stderr)
         err_key = now.strftime("%Y-%m-%dT%H") + "|ENGINE_ERROR"
         send_once(
             state, "special", err_key,
-            f"🚨 <b>NIFTY R8 ENGINE WARNING</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🚨 <b>NIFTY R7 ENGINE WARNING</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
             f"⚠️ <code>{html.escape(runtime_error[-1200:])}</code>\n"
             f"🔁 The next scheduled run will retry automatically.",
@@ -597,12 +840,14 @@ def main() -> None:
             if pd.Timestamp(r.Entry_Time).normalize() != tday: continue
             k = trade_key(r); em = pd.Timestamp(r.Entry_Time).hour*60 + pd.Timestamp(r.Entry_Time).minute
             if k not in seen_e and em <= LIVE_ENTRY_CUTOFF_MIN:
+                log_trade_event("ENTRY", r, cache, now)
                 ok = telegram(entry_message(r, cache, parent, day_pnl, week_pnl, streak), args.no_telegram)
                 if delivered(ok, args.no_telegram):
                     seen_e.add(k)
             xk = k + "|" + pd.Timestamp(r.Exit_Time).isoformat()
             # A row ending exactly at current data edge may be a live/open row forced by replay; don't announce it as exit yet.
             if latest is not None and pd.Timestamp(r.Exit_Time) < pd.Timestamp(latest) and xk not in seen_x:
+                log_trade_event("EXIT", r, cache, now)
                 ok = telegram(exit_message(r, cache, day_pnl, week_pnl), args.no_telegram)
                 if delivered(ok, args.no_telegram):
                     seen_x.add(xk)
@@ -620,17 +865,26 @@ def main() -> None:
             live_px, prev_px = fetch_fast_price() if not args.offline_csv else (None, None)
             open_spot = live_px if live_px is not None else spot
             open_text = status_message(now, open_spot, spot_ts, parent, day_pnl, week_pnl, streak, trades_today, len(active))
-            open_text = open_text.replace("🔵 <b>NIFTY R8 LIVE STATUS</b>", "🟢 <b>NIFTY R8 MARKET OPEN / LIVE START</b>", 1)
-            if send_once(state, "special", key, open_text, args.no_telegram):
-                hb0915 = date_key + "|HB0915"
-                if hb0915 not in state["heartbeats"]:
-                    state["heartbeats"].append(hb0915)
+            open_text = open_text.replace("🔵 <b>NIFTY R7 LIVE STATUS</b>", "🟢 <b>NIFTY R7 MARKET OPEN / LIVE START</b>", 1)
+            delivered_open = send_once(state, "special", key, open_text, args.no_telegram)
+            hb0915 = date_key + "|HB0915"
+            log_status_slot(
+                hb0915, now, open_spot, spot_ts, parent, day_pnl, week_pnl,
+                streak, trades_today, len(active), delivered_open
+            )
+            if delivered_open and hb0915 not in state["heartbeats"]:
+                state["heartbeats"].append(hb0915)
 
     # 30-minute heartbeat/status: 09:15, 09:45, 10:15 ... 15:15.
     hb_key = heartbeat_slot_key(now)
     if hb_key and hb_key not in state["heartbeats"]:
         ok = telegram(status_message(now, spot, spot_ts, parent, day_pnl, week_pnl, streak, trades_today, len(active)), args.no_telegram)
-        if delivered(ok, args.no_telegram):
+        delivered_hb = delivered(ok, args.no_telegram)
+        log_status_slot(
+            hb_key, now, spot, spot_ts, parent, day_pnl, week_pnl,
+            streak, trades_today, len(active), delivered_hb
+        )
+        if delivered_hb:
             state["heartbeats"].append(hb_key)
     # 15:30 run reports completed 15:29 spot; no new entries are permitted here.
     if 15*60+29 <= m <= 15*60+40:
@@ -640,7 +894,7 @@ def main() -> None:
             c = float(close1529.iloc[-1]) if len(close1529) else spot
             ctext = "—" if c is None else f"{c:.2f}"
             eod_text = (
-                f"🌙 <b>NIFTY R8 END-OF-DAY REPORT</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"🌙 <b>NIFTY R7 END-OF-DAY REPORT</b>\n━━━━━━━━━━━━━━━━━━\n"
                 f"📅 <b>{now.strftime('%d-%b-%Y')}</b>\n"
                 f"📍 <b>15:29 spot:</b> <code>{ctext}</code>\n"
                 f"{pnl_icon(day_pnl)} <b>Day:</b> <code>{fmt_points(day_pnl)}</code> pts\n"
@@ -660,7 +914,25 @@ def main() -> None:
     if isinstance(recent, pd.DataFrame) and len(recent):
         for _, r in recent.iterrows():
             recent_records.append({"module":str(r.get("Module","")),"direction":str(r.get("Direction","")),"entry":str(r.Entry_Time),"exit":str(r.Exit_Time),"points":float(r.Points)})
-        recent[[c for c in ["Module","Direction","Entry_Time","Exit_Time","Points"] if c in recent.columns]].to_csv(TRADES_FILE,index=False)
+
+    # Keep root viewer trade data current with the full rolling live replay.
+    if isinstance(trades, pd.DataFrame) and len(trades):
+        trade_cols = [c for c in ["Module","Direction","Entry_Time","Exit_Time","Points"] if c in trades.columns]
+        trades[trade_cols].sort_values(["Entry_Time","Exit_Time"]).to_csv(TRADES_FILE, index=False)
+    else:
+        pd.DataFrame(columns=["Module","Direction","Entry_Time","Exit_Time","Points"]).to_csv(TRADES_FILE, index=False)
+
+    # Rebuild the Excel report every run so today's trades and period ledgers cannot go stale.
+    try:
+        write_live_excel_report(
+            EXCEL_REPORT_FILE, trades, cache, now, spot, parent,
+            day_pnl, week_pnl, streak, runtime_error or data_error
+        )
+    except Exception as e:
+        report_err = f"Excel report failed: {type(e).__name__}: {e}"
+        print(report_err, file=sys.stderr)
+        runtime_error = (runtime_error + " | " if runtime_error else "") + report_err
+
     status = {
         "updated_at_ist": now.isoformat(), "phase": phase, "symbol": SYMBOL,
         "source": "Yahoo Finance 1m + rolling repository cache" if not args.offline_csv else "offline CSV test",
