@@ -1,54 +1,46 @@
 {
-  "updated_at_ist": "2026-10-01T12:49:52.371877+05:30",
+  "updated_at_ist": "2026-10-01T14:13:48.980091+05:30",
   "phase": "live-trading",
   "symbol": "^NSEI",
   "source": "Yahoo Finance 1m + rolling repository cache",
   "spot": {
-    "last_completed_1m": 22400.05078125,
-    "timestamp": "2026-10-01 12:48:00"
+    "last_completed_1m": 22275.80078125,
+    "timestamp": "2026-10-01 14:12:00"
   },
   "parent_30m": {
     "direction": "BEAR",
-    "ema19": 22615.88324686624,
-    "ema29": 22664.086113143767,
-    "gap": 48.20286627752648,
-    "last_completed_30m": "2026-10-01 12:44:00",
+    "ema19": 22561.977461211653,
+    "ema29": 22621.39592557468,
+    "gap": 59.41846436302876,
+    "last_completed_30m": "2026-10-01 13:44:00",
     "cross": null
   },
   "live": {
-    "day_points": 75.6484375,
-    "week_points": 80.44921875,
+    "day_points": 112.0,
+    "week_points": 116.80078125,
     "loss_streak": 0,
     "sessions_in_cache": 8,
     "warmup_ready": true,
     "entry_cutoff_ist": "15:15",
-    "active_edge_rows": [
-      {
-        "Module": "REPAIR_A",
-        "Direction": "SHORT",
-        "Entry_Time": "2026-10-01 12:45:00",
-        "Exit_Time": "2026-10-01 12:48:00",
-        "Points": 33.6484375
-      }
-    ]
+    "active_edge_rows": []
   },
   "engine_replay": {
-    "net": 204.19921875,
-    "pf": 2.927331047450503,
+    "net": 240.55078125,
+    "pf": 3.2704346864284926,
     "dd": 40.19921875,
     "trades": 21,
     "win_rate": 42.857142857142854
   },
   "checkpoint": {
-    "name": "R7-8 verified",
+    "name": "R8-14 locked / exact replay",
     "period": "2020-01-01 to 2026-05-15",
-    "points": 41124.25,
-    "pf": 3.3902151959431044,
+    "points": 42371.65,
+    "pf": 3.43843858533484,
     "dd": 261.45,
-    "trades": 2631,
-    "green_weeks": 217,
-    "red_weeks": 76,
-    "flat_weeks": 40
+    "trades": 2716,
+    "green_weeks": 224,
+    "red_weeks": 70,
+    "flat_weeks": 39
   },
   "recent_trades": [
     {
@@ -195,8 +187,8 @@
       "module": "REPAIR_A",
       "direction": "SHORT",
       "entry": "2026-10-01 12:45:00",
-      "exit": "2026-10-01 12:48:00",
-      "points": 33.6484375
+      "exit": "2026-10-01 12:50:00",
+      "points": 70.0
     }
   ],
   "error": null
