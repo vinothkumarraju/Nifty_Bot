@@ -1,35 +1,35 @@
 {
-  "updated_at_ist": "2026-09-30T23:06:05.747339+05:30",
-  "phase": "closed",
+  "updated_at_ist": "2026-10-01T11:32:27.975627+05:30",
+  "phase": "live-trading",
   "symbol": "^NSEI",
   "source": "Yahoo Finance 1m + rolling repository cache",
   "spot": {
-    "last_completed_1m": 22620.44921875,
-    "timestamp": "2026-09-30 15:29:00"
+    "last_completed_1m": 22546.099609375,
+    "timestamp": "2026-10-01 11:31:00"
   },
   "parent_30m": {
     "direction": "BEAR",
-    "ema19": 22709.325161685134,
-    "ema29": 22745.580617843905,
-    "gap": 36.25545615877127,
-    "last_completed_30m": "2026-09-30 15:14:00",
+    "ema19": 22657.519872565994,
+    "ema29": 22700.540991077425,
+    "gap": 43.02111851143127,
+    "last_completed_30m": "2026-10-01 11:14:00",
     "cross": null
   },
   "live": {
-    "day_points": 25.0,
-    "week_points": 4.80078125,
-    "loss_streak": 1,
-    "sessions_in_cache": 7,
+    "day_points": -10.0,
+    "week_points": -5.19921875,
+    "loss_streak": 2,
+    "sessions_in_cache": 8,
     "warmup_ready": true,
     "entry_cutoff_ist": "15:15",
     "active_edge_rows": []
   },
   "engine_replay": {
-    "net": 128.55078125,
-    "pf": 2.3397793429141394,
+    "net": 118.55078125,
+    "pf": 2.1189396453194704,
     "dd": 40.19921875,
-    "trades": 18,
-    "win_rate": 38.88888888888889
+    "trades": 19,
+    "win_rate": 36.84210526315789
   },
   "checkpoint": {
     "name": "R7-8 verified",
@@ -168,6 +168,13 @@
       "entry": "2026-09-30 14:30:00",
       "exit": "2026-09-30 14:48:00",
       "points": -0.0
+    },
+    {
+      "module": "REPAIR_A",
+      "direction": "SHORT",
+      "entry": "2026-10-01 11:10:00",
+      "exit": "2026-10-01 11:11:00",
+      "points": -10.0
     }
   ],
   "error": null
