@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-NIFTY R7 LIVE RUNNER (GitHub Actions)
+NIFTY R8 LIVE RUNNER (GitHub Actions)
 =====================================
 
 Purpose
@@ -66,15 +66,15 @@ LIVE_ENTRY_CUTOFF_MIN = 15 * 60 + 15
 REGULAR_END_MIN = 15 * 60 + 30
 HEARTBEAT_MINUTES = 30
 CHECKPOINT = {
-    "name": "R7-8 verified",
+    "name": "R8-14 locked / exact replay",
     "period": "2020-01-01 to 2026-05-15",
-    "points": 41124.25,
-    "pf": 3.3902151959431044,
+    "points": 42371.65,
+    "pf": 3.43843858533484,
     "dd": 261.45,
-    "trades": 2631,
-    "green_weeks": 217,
-    "red_weeks": 76,
-    "flat_weeks": 40,
+    "trades": 2716,
+    "green_weeks": 224,
+    "red_weeks": 70,
+    "flat_weeks": 39,
 }
 
 
@@ -227,7 +227,7 @@ def run_rules_engine(cache: pd.DataFrame, runtime_dir: Path) -> tuple[dict[str, 
     cmd = [sys.executable, str(ENGINE_FILE), "--nifty", str(raw), "--start", start, "--end", end, "--out", str(runtime_dir)]
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=150)
     if p.returncode != 0:
-        raise RuntimeError(f"R7 engine failed: {p.stderr[-2000:]}")
+        raise RuntimeError(f"R8 engine failed: {p.stderr[-2000:]}")
     summary = load_json(runtime_dir / "summary.json", None)
     trades = pd.read_csv(runtime_dir / "all_generated.csv") if (runtime_dir / "all_generated.csv").exists() else pd.DataFrame()
     if len(trades):
@@ -320,7 +320,7 @@ def direction_meta(direction: str) -> tuple[str, str, str]:
 
 
 def module_target_points(module: str) -> float | None:
-    # Fixed-harvest R7 child modules only. Older parent/runner modules are
+    # Fixed-harvest R7/R8 child modules. Older parent/runner modules are
     # managed by their own trailing / state exits and intentionally show no
     # synthetic target in Telegram.
     targets = {
@@ -330,6 +330,16 @@ def module_target_points(module: str) -> float | None:
         "R7_6_SECOND_CHILD": 25.0,
         "R7_7_MORNING_PROOF_LONG": 20.0,
         "R7_8_LATE_CHILD": 20.0,
+        "R8_1_REARM": 20.0,
+        "R8_2_15M_LONG_SHORT_CHILD": 20.0,
+        "R8_SHADOW_LONG": 25.0,
+        "R8_5_GAP_OR30": 20.0,
+        "R8_OPENING_DRIVE_SHORT": 100.0,
+        "R8_PULLBACK_RECLAIM_HQ": 40.0,
+        "R8_COUNTERSWING_RECLAIM": 60.0,
+        "R8_LATE_COUNTER_RECLAIM": 40.0,
+        "R8_MIDDAY_LONG_TRANSITION": 40.0,
+        "R8_LATE_LONG_TRANSITION": 40.0,
     }
     return targets.get(str(module))
 
@@ -381,7 +391,7 @@ def status_message(
             ts_text = str(spot_ts)
     active_line = f"\n🔔 <b>Active edge rows:</b> {active_count}" if active_count else ""
     return (
-        f"🔵 <b>NIFTY R7 LIVE STATUS</b>\n"
+        f"🔵 <b>NIFTY R8 LIVE STATUS</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"🕒 <b>{now.strftime('%d-%b-%Y %H:%M IST')}</b>\n"
         f"📍 <b>Spot:</b> <code>{spot_text}</code>  <i>(1m {html.escape(ts_text)})</i>\n"
@@ -392,7 +402,7 @@ def status_message(
         f"🧾 <b>Generated trades today:</b> {trades_today}"
         f"{active_line}\n"
         f"⏰ <b>New-entry cutoff:</b> 15:15 IST\n"
-        f"🧠 <b>Engine:</b> R7 rules-only · completed candles → next-1m fill"
+        f"🧠 <b>Engine:</b> R8 rules-only · completed candles → next-1m fill"
     )
 
 
@@ -413,7 +423,7 @@ def entry_message(
     entry_text = "—" if entry_spot is None else f"{entry_spot:.2f}"
     parent_dir = str(parent.get("direction", "UNKNOWN"))
     return (
-        f"🚨 <b>R7 NEW TRADE / SIGNAL</b>\n"
+        f"🚨 <b>R8 NEW TRADE / SIGNAL</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"{icon} <b>{html.escape(dlabel)}</b>  →  <b>{html.escape(option_action)}</b>\n"
         f"🧩 <b>Module:</b> <code>{html.escape(module)}</code>\n"
@@ -438,13 +448,13 @@ def exit_message(row: pd.Series, cache: pd.DataFrame, day_pnl: float, week_pnl: 
     exit_spot = cache_price_at(cache, xt, "open")
     exit_text = "—" if exit_spot is None else f"{exit_spot:.2f}"
     if points > 0:
-        header = "✅ <b>R7 PROFIT EXIT</b>"
+        header = "✅ <b>R8 PROFIT EXIT</b>"
         result_icon = "🟢"
     elif points <= -9.5:
-        header = "🛑 <b>R7 STOP / LOSS EXIT</b>"
+        header = "🛑 <b>R8 STOP / LOSS EXIT</b>"
         result_icon = "🔴"
     else:
-        header = "⚪ <b>R7 FLAT / PROTECTED EXIT</b>"
+        header = "⚪ <b>R8 FLAT / PROTECTED EXIT</b>"
         result_icon = "⚪"
     return (
         f"{header}\n"
@@ -472,7 +482,7 @@ def main() -> None:
     # This makes Telegram verification immediate even when run outside a heartbeat slot.
     if os.getenv("NIFTY_TRIGGER", "").strip() == "workflow_dispatch" and not args.no_telegram:
         telegram(
-            f"🧪 <b>NIFTY R7 MANUAL TEST</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🧪 <b>NIFTY R8 MANUAL TEST</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"✅ GitHub Actions reached the live runner\n"
             f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
             f"📡 Telegram connection is working."
@@ -487,11 +497,11 @@ def main() -> None:
     if 9*60 <= m < 9*60+30:
         key = date_key + "|0900"
         online_text = (
-            f"🟦 <b>NIFTY R7 BOT ONLINE</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🟦 <b>NIFTY R8 BOT ONLINE</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"🕘 <b>Scheduled:</b> 09:00 IST\n"
             f"▶️ <b>Actual wake:</b> {now.strftime('%d-%b-%Y %H:%M IST')}\n"
             f"📡 Pre-session monitoring active\n"
-            f"🧠 R7 rules-only engine ready\n"
+            f"🧠 R8 rules-only engine ready\n"
             f"⏳ Next: 09:10 pre-session · 09:15 market start"
         )
         send_once(state, "special", key, online_text, args.no_telegram)
@@ -506,7 +516,7 @@ def main() -> None:
                 pct = (chg / pc * 100.0) if chg is not None and pc not in (None, 0) else None
                 gap_icon = pnl_icon(chg)
                 pre_text = (
-                    f"🟣 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    f"🟣 <b>NIFTY R8 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
                     f"🕘 <b>Scheduled:</b> 09:10 IST  |  <b>Delivered:</b> {now.strftime('%H:%M IST')}\n"
                     f"📍 <b>Yahoo latest:</b> <code>{lp:.2f}</code>"
                 )
@@ -516,10 +526,10 @@ def main() -> None:
                     pre_text += f"\n{gap_icon} <b>Gap:</b> <code>{chg:+.2f}</code> pts"
                     if pct is not None:
                         pre_text += f"  (<code>{pct:+.2f}%</code>)"
-                pre_text += "\n⏳ R7 entries begin only after completed market candles are available."
+                pre_text += "\n⏳ R8 entries begin only after completed market candles are available."
             else:
                 pre_text = (
-                    f"🟡 <b>NIFTY R7 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    f"🟡 <b>NIFTY R8 PRE-SESSION</b>\n━━━━━━━━━━━━━━━━━━\n"
                     f"🕘 <b>Scheduled:</b> 09:10 IST  |  <b>Delivered:</b> {now.strftime('%H:%M IST')}\n"
                     f"⚠️ Yahoo fast price unavailable. The next 5-minute run will retry market data."
                 )
@@ -558,14 +568,14 @@ def main() -> None:
 
     summary = None; trades = pd.DataFrame(); runtime_error = None
     try:
-        with tempfile.TemporaryDirectory(prefix="nifty_r7_live_") as td:
+        with tempfile.TemporaryDirectory(prefix="nifty_r8_live_") as td:
             summary, trades = run_rules_engine(cache, Path(td))
     except Exception as e:
         runtime_error = str(e); print(runtime_error, file=sys.stderr)
         err_key = now.strftime("%Y-%m-%dT%H") + "|ENGINE_ERROR"
         send_once(
             state, "special", err_key,
-            f"🚨 <b>NIFTY R7 ENGINE WARNING</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"🚨 <b>NIFTY R8 ENGINE WARNING</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"🕒 {now.strftime('%d-%b-%Y %H:%M IST')}\n"
             f"⚠️ <code>{html.escape(runtime_error[-1200:])}</code>\n"
             f"🔁 The next scheduled run will retry automatically.",
@@ -610,7 +620,7 @@ def main() -> None:
             live_px, prev_px = fetch_fast_price() if not args.offline_csv else (None, None)
             open_spot = live_px if live_px is not None else spot
             open_text = status_message(now, open_spot, spot_ts, parent, day_pnl, week_pnl, streak, trades_today, len(active))
-            open_text = open_text.replace("🔵 <b>NIFTY R7 LIVE STATUS</b>", "🟢 <b>NIFTY R7 MARKET OPEN / LIVE START</b>", 1)
+            open_text = open_text.replace("🔵 <b>NIFTY R8 LIVE STATUS</b>", "🟢 <b>NIFTY R8 MARKET OPEN / LIVE START</b>", 1)
             if send_once(state, "special", key, open_text, args.no_telegram):
                 hb0915 = date_key + "|HB0915"
                 if hb0915 not in state["heartbeats"]:
@@ -630,7 +640,7 @@ def main() -> None:
             c = float(close1529.iloc[-1]) if len(close1529) else spot
             ctext = "—" if c is None else f"{c:.2f}"
             eod_text = (
-                f"🌙 <b>NIFTY R7 END-OF-DAY REPORT</b>\n━━━━━━━━━━━━━━━━━━\n"
+                f"🌙 <b>NIFTY R8 END-OF-DAY REPORT</b>\n━━━━━━━━━━━━━━━━━━\n"
                 f"📅 <b>{now.strftime('%d-%b-%Y')}</b>\n"
                 f"📍 <b>15:29 spot:</b> <code>{ctext}</code>\n"
                 f"{pnl_icon(day_pnl)} <b>Day:</b> <code>{fmt_points(day_pnl)}</code> pts\n"
