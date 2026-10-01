@@ -1,35 +1,43 @@
 {
-  "updated_at_ist": "2026-10-01T11:32:27.975627+05:30",
+  "updated_at_ist": "2026-10-01T12:49:52.371877+05:30",
   "phase": "live-trading",
   "symbol": "^NSEI",
   "source": "Yahoo Finance 1m + rolling repository cache",
   "spot": {
-    "last_completed_1m": 22546.099609375,
-    "timestamp": "2026-10-01 11:31:00"
+    "last_completed_1m": 22400.05078125,
+    "timestamp": "2026-10-01 12:48:00"
   },
   "parent_30m": {
     "direction": "BEAR",
-    "ema19": 22657.519872565994,
-    "ema29": 22700.540991077425,
-    "gap": 43.02111851143127,
-    "last_completed_30m": "2026-10-01 11:14:00",
+    "ema19": 22615.88324686624,
+    "ema29": 22664.086113143767,
+    "gap": 48.20286627752648,
+    "last_completed_30m": "2026-10-01 12:44:00",
     "cross": null
   },
   "live": {
-    "day_points": -10.0,
-    "week_points": -5.19921875,
-    "loss_streak": 2,
+    "day_points": 75.6484375,
+    "week_points": 80.44921875,
+    "loss_streak": 0,
     "sessions_in_cache": 8,
     "warmup_ready": true,
     "entry_cutoff_ist": "15:15",
-    "active_edge_rows": []
+    "active_edge_rows": [
+      {
+        "Module": "REPAIR_A",
+        "Direction": "SHORT",
+        "Entry_Time": "2026-10-01 12:45:00",
+        "Exit_Time": "2026-10-01 12:48:00",
+        "Points": 33.6484375
+      }
+    ]
   },
   "engine_replay": {
-    "net": 118.55078125,
-    "pf": 2.1189396453194704,
+    "net": 204.19921875,
+    "pf": 2.927331047450503,
     "dd": 40.19921875,
-    "trades": 19,
-    "win_rate": 36.84210526315789
+    "trades": 21,
+    "win_rate": 42.857142857142854
   },
   "checkpoint": {
     "name": "R7-8 verified",
@@ -175,6 +183,20 @@
       "entry": "2026-10-01 11:10:00",
       "exit": "2026-10-01 11:11:00",
       "points": -10.0
+    },
+    {
+      "module": "REPAIR_B",
+      "direction": "SHORT",
+      "entry": "2026-10-01 12:25:00",
+      "exit": "2026-10-01 12:45:00",
+      "points": 52.0
+    },
+    {
+      "module": "REPAIR_A",
+      "direction": "SHORT",
+      "entry": "2026-10-01 12:45:00",
+      "exit": "2026-10-01 12:48:00",
+      "points": 33.6484375
     }
   ],
   "error": null
