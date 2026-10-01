@@ -1,18 +1,18 @@
 {
-  "updated_at_ist": "2026-10-01T14:33:40.502460+05:30",
-  "phase": "live-trading",
+  "updated_at_ist": "2026-10-01T20:08:01.496776+05:30",
+  "phase": "closed",
   "symbol": "^NSEI",
   "source": "Yahoo Finance 1m + rolling repository cache",
   "spot": {
-    "last_completed_1m": 22331.69921875,
-    "timestamp": "2026-10-01 14:32:00"
+    "last_completed_1m": 22421.94921875,
+    "timestamp": "2026-10-01 15:29:00"
   },
   "parent_30m": {
     "direction": "BEAR",
-    "ema19": 22535.39475415299,
-    "ema29": 22599.71288991137,
-    "gap": 64.31813575838169,
-    "last_completed_30m": "2026-10-01 14:14:00",
+    "ema19": 22510.46324695767,
+    "ema29": 22574.40811569779,
+    "gap": 63.94486874012,
+    "last_completed_30m": "2026-10-01 15:14:00",
     "cross": null
   },
   "live": {
