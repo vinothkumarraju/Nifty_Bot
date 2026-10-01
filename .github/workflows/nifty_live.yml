@@ -66,7 +66,8 @@ jobs:
             'pandas>=2.2,<3' \
             'yfinance>=0.2.54,<1' \
             'requests>=2.32,<3' \
-            'numba>=0.60,<1'
+            'numba>=0.60,<1' \
+            'xlsxwriter>=3.2,<4'
 
       - name: Validate Telegram configuration
         env:
@@ -99,7 +100,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python NIFTY_LIVE_ENGINE.py
 
-      - name: Persist cache, state and viewer data
+      - name: Persist cache, state, logs and report
         if: always()
         shell: bash
         run: |
@@ -108,6 +109,8 @@ jobs:
           for f in live_cache.csv live_state.json live_status.json live_trades.csv; do
             [ -f "$f" ] && git add "$f"
           done
+          [ -d logs ] && git add logs/ || true
+          [ -d reports ] && git add reports/ || true
           if ! git diff --cached --quiet; then
             git commit -m "chore: update NIFTY live state [skip ci]"
             git pull --rebase origin "${GITHUB_REF_NAME}" || true
