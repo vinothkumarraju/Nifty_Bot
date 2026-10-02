@@ -1,6 +1,6 @@
 {
-  "updated_at_ist": "2026-10-02T15:29:56.269586+05:30",
-  "phase": "reporting-only",
+  "updated_at_ist": "2026-10-02T15:54:23.560060+05:30",
+  "phase": "closed",
   "symbol": "^NSEI",
   "source": "Yahoo Finance 1m + rolling repository cache",
   "spot": {
