@@ -25,7 +25,7 @@ jobs:
     env:
       TZ: Asia/Kolkata
       NIFTY_SYMBOL: ^NSEI
-      NIFTY_ENGINE: NIFTY_RULES_ONLY_ENGINE.py
+      NIFTY_ENGINE_PATH: NIFTY_RULES_ONLY_ENGINE.py
       LIVE_CACHE: live_cache.csv
       LIVE_STATE: live_state.json
       LIVE_STATUS: live_status.json
