@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """
-NIFTY RULES-ONLY TREND ENGINE R7
-====================================
+NIFTY R9 LIVE-FIT RULES-ONLY TREND ENGINE
+================================
 
-Standalone, live-causal strategy engine.
+Standalone, live-causal NIFTY strategy engine.
 
-Input: raw NIFTY 1-minute OHLC CSV/ZIP only.
-Output: signals/trades generated sequentially from rules in this file.
+Input
+-----
+Raw NIFTY 1-minute OHLC CSV or ZIP only.
 
-Integrity standard:
+Output
+------
+Signals, entries, exits, trade logs, period metrics and summary files are
+generated sequentially from strategy rules in this file.
+
+Integrity rules
+---------------
 - no historical trade rows or timestamps embedded;
-- no historical P&L ledger or precomputed signal table;
+- no historical P&L ledger, precomputed signal table, or forced benchmark;
 - no base64/gzip/encoded historical trades;
-- no result-forcing checksum or target P&L constant;
-- decisions use completed bars and next valid 1-minute fills;
+- no date-specific winning/losing-week exceptions;
+- decisions use only completed information available at that moment;
+- completed-bar signals fill at the next valid 1-minute open;
 - every paid initial stop is at least 10 NIFTY points;
-- R4 preserves R3 and adds a causal CORE stale-risk exit: after a configurable
-  number of completed market minutes, if a leg has failed to prove enough MFE
-  and remains weak, exit only at the NEXT 1-minute open. No future data is used.
+- R9 short-child trades are same-day, non-overlapping and capped at 15 minutes;
+- historical data is used only when supplied at runtime as raw 1-minute input.
 
-Historical data is used only when supplied at runtime as the raw 1-minute input.
-
-R6 accepted rule:
-- Preserve the verified R5 A/B/C2145 architecture.
-- R5-B may not initiate a new paid entry from 11:30 through 12:59 session time.
-  Existing open trades and opposite-break exit signals remain unchanged.
+This LIVE-FIT branch deliberately removes later high-backtest branches and keeps
+only a simpler three-family R9 child core (S1/S2/S6). The objective is robustness,
+not maximum historical points. R9-LF8 adds two causal missed-trend repair
+routes (morning bearish breakout and late aligned displacement) on top of the
+exact LF7 base. No backtest can prove future profitability.
 """
 import pandas as pd, numpy as np, itertools, json, math, time, zipfile
 from multiprocessing import Pool, cpu_count
@@ -1018,68 +1024,65 @@ def _period_counts(df, realized):
 
 def _itm3_execution_segments(df, core, swing, *, profit_roll=70.0, max_sessions=2,
                              roll_hour=15, roll_minute=15):
-    """Generate an option-execution roll plan from current-run rules only.
+    """Convert CORE/SWING parent legs into short ITM3 execution children.
 
-    This does NOT alter the parent NIFTY strategy P&L. It converts long-lived
-    CORE/SWING parent exposure into short ITM3 execution children:
-      * at each 15:15 session boundary, harvest/roll if child spot profit >= +70;
-      * regardless of P&L, roll by the second trading session so the same
-        weekly ITM3 contract is not intentionally carried through a long trend;
-      * close and reopen at the same NIFTY reference, so child spot points
-        telescope exactly back to the parent spot points.
-
-    The parent trend remains alive after a roll. Actual strike/expiry selection
-    belongs to the live options execution layer.
+    Parent trend state is unchanged. Each paid child spans at most max_sessions
+    trading sessions. A +profit_roll harvest may roll earlier. Child spot P&L
+    telescopes exactly to each parent leg, including same-minute stop trades.
     """
-    times=df.timestamp.to_numpy(dtype='datetime64[ns]')
-    op=df.open.to_numpy(float)
-    dates=pd.to_datetime(df.timestamp).dt.normalize()
-    unique_days=list(pd.Index(dates.unique()).sort_values())
-    day_pos={pd.Timestamp(d).date():i for i,d in enumerate(unique_days)}
-    lookup={pd.Timestamp(ts):float(px) for ts,px in zip(df.timestamp,op)}
-
+    x=df[['timestamp','open']].copy().reset_index(drop=True)
+    x['day']=x.timestamp.dt.normalize()
+    days=list(pd.Index(x.day.unique()).sort_values())
+    day_pos={pd.Timestamp(d):i for i,d in enumerate(days)}
+    # Robust session boundary: last available regular minute at or before the
+    # requested roll time. This avoids accidental 3-session children if one
+    # exact 15:15 row is missing.
+    refs={}
+    cutoff=roll_hour*60+roll_minute
+    for day,g in x.groupby('day',sort=False):
+        mm=g.timestamp.dt.hour*60+g.timestamp.dt.minute
+        q=g[mm<=cutoff]
+        if len(q):
+            r=q.iloc[-1]; refs[pd.Timestamp(day)]=(pd.Timestamp(r.timestamp),float(r.open))
     parents=[]
-    for r in core.itertuples(index=False):
+    for j,r in core.reset_index(drop=True).iterrows():
         d=1 if str(r.Direction)=='LONG' else -1
-        parents.append(dict(Parent_Module='CORE',Parent_ID=int(r.Parent_Regime_ID),Direction='LONG' if d==1 else 'SHORT',d=d,
-                            Entry_Time=pd.Timestamp(r.Entry_Time),Exit_Time=pd.Timestamp(r.Exit_Time),
-                            Entry_Price=float(r.NIFTY_Entry),Exit_Price=float(r.NIFTY_Exit)))
-    for j,r in enumerate(swing.itertuples(index=False),1):
-        d=int(r.d)
-        parents.append(dict(Parent_Module='SWING',Parent_ID=j,Direction='LONG' if d==1 else 'SHORT',d=d,
-                            Entry_Time=pd.Timestamp(r.Entry_Time),Exit_Time=pd.Timestamp(r.Exit_Time),
-                            Entry_Price=float(r.Entry),Exit_Price=float(r.Exit)))
-
+        parents.append(('CORE',int(j),d,pd.Timestamp(r.Entry_Time),pd.Timestamp(r.Exit_Time),
+                        float(r.NIFTY_Entry),float(r.NIFTY_Exit),float(r.Points)))
+    for j,r in swing.reset_index(drop=True).iterrows():
+        parents.append(('SWING',int(j),int(r.d),pd.Timestamp(r.Entry_Time),pd.Timestamp(r.Exit_Time),
+                        float(r.Entry),float(r.Exit),float(r.Points)))
     out=[]
-    for p in parents:
-        e=p['Entry_Time']; x=p['Exit_Time']; d=p['d']
-        if e.date() not in day_pos or x.date() not in day_pos or x<=e:
+    for mod,pid,d,e,xit,ep,xp,parent_pts in parents:
+        if e.normalize() not in day_pos or xit.normalize() not in day_pos or xit<e:
             continue
-        child_start=e; child_px=p['Entry_Price']; child_session0=day_pos[e.date()]; seg=1
-        end_day=day_pos[x.date()]
-        k=child_session0
-        while k<=end_day:
-            bd=pd.Timestamp(unique_days[k])+pd.Timedelta(hours=roll_hour,minutes=roll_minute)
-            if child_start < bd < x and bd in lookup:
-                px=float(lookup[bd]); pnl=float(d*(px-child_px)); age=int(k-child_session0+1)
-                reason=None
-                if pnl>=profit_roll: reason='PROFIT_ROLL_70'
-                elif age>=max_sessions: reason='AGE_ROLL_2D'
-                if reason is not None:
-                    out.append(dict(Parent_Module=p['Parent_Module'],Parent_ID=p['Parent_ID'],Segment_ID=seg,
-                                    Direction=p['Direction'],Entry_Time=child_start,Exit_Time=bd,
-                                    Entry_Price=float(child_px),Exit_Price=px,Spot_Points=pnl,
-                                    Exit_Reason=reason,Trading_Sessions=age))
-                    seg+=1;child_start=bd;child_px=px;child_session0=k
-            k+=1
-        age=max(1,end_day-child_session0+1)
-        out.append(dict(Parent_Module=p['Parent_Module'],Parent_ID=p['Parent_ID'],Segment_ID=seg,
-                        Direction=p['Direction'],Entry_Time=child_start,Exit_Time=x,
-                        Entry_Price=float(child_px),Exit_Price=float(p['Exit_Price']),
-                        Spot_Points=float(d*(p['Exit_Price']-child_px)),Exit_Reason='PARENT_EXIT',
-                        Trading_Sessions=int(age)))
+        if xit==e:
+            out.append(dict(Parent_Module=mod,Parent_ID=pid,Segment_ID=1,
+                            Direction='LONG' if d==1 else 'SHORT',Entry_Time=e,Exit_Time=xit,
+                            Entry_Price=ep,Exit_Price=xp,Spot_Points=parent_pts,
+                            Exit_Reason='PARENT_EXIT',Trading_Sessions=1))
+            continue
+        child_e=e; child_ep=ep; child_day=day_pos[e.normalize()]; seg=1
+        for k in range(child_day,day_pos[xit.normalize()]+1):
+            day=pd.Timestamp(days[k])
+            if day not in refs: continue
+            bt,bp=refs[day]
+            if not (child_e < bt < xit): continue
+            age=int(k-child_day+1); pnl=float(d*(bp-child_ep)); reason=None
+            if pnl>=profit_roll: reason='PROFIT_ROLL_70'
+            elif age>=max_sessions: reason='AGE_ROLL_2D'
+            if reason is not None:
+                out.append(dict(Parent_Module=mod,Parent_ID=pid,Segment_ID=seg,
+                                Direction='LONG' if d==1 else 'SHORT',Entry_Time=child_e,Exit_Time=bt,
+                                Entry_Price=float(child_ep),Exit_Price=float(bp),Spot_Points=pnl,
+                                Exit_Reason=reason,Trading_Sessions=age))
+                seg+=1; child_e=bt; child_ep=bp; child_day=k
+        age=int(day_pos[xit.normalize()]-child_day+1)
+        out.append(dict(Parent_Module=mod,Parent_ID=pid,Segment_ID=seg,
+                        Direction='LONG' if d==1 else 'SHORT',Entry_Time=child_e,Exit_Time=xit,
+                        Entry_Price=float(child_ep),Exit_Price=float(xp),Spot_Points=float(d*(xp-child_ep)),
+                        Exit_Reason='PARENT_EXIT',Trading_Sessions=age))
     return pd.DataFrame(out)
-
 
 def _loss_duration_diagnostics(frames):
     rows=[]
@@ -1932,7 +1935,7 @@ def _r7_combine(base,*layers):
     return q.sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
 
 
-def run_engine(args):
+def _run_r7_engine(args, return_frames=False):
     init(args.nifty)
     p=r4_core_params(args.start,args.end)
     _,legs,masters=sim(p,frames=True)
@@ -1978,6 +1981,8 @@ def run_engine(args):
         layers[name]=_r7_metrics_detail(z) if z is not None and len(z) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.}
     summary={'engine':'NIFTY_R7_RULES_ONLY_ITM3_SHORT_CHILDREN','combined':fm,'daily':counts['daily'],'weekly':counts['weekly'],'yearly':yearly,'r7_layers':layers,'rules':R7_RULES,
              'integrity':{'raw_minute_only':True,'historical_trade_rows_embedded':False,'historical_timestamps_embedded':False,'precomputed_pnl_embedded':False,'date_specific_fixes':False,'completed_bar_next_minute_fills':True,'minimum_paid_initial_stop_points':10.0}}
+    if return_frames:
+        return sdf, final, summary
     print(json.dumps(summary,indent=2,default=str))
     if args.out:
         from pathlib import Path
@@ -1987,12 +1992,1297 @@ def run_engine(args):
         final.to_csv(out/'all_generated.csv',index=False);(out/'summary.json').write_text(json.dumps(summary,indent=2,default=str))
 
 
+
+# -----------------------------------------------------------------------------
+# R8 short-duration ITM3 trend-catcher extensions.
+# Every array below is derived from the current raw-minute input at runtime.
+# Historical trend labels are intentionally absent from the trading engine.
+# -----------------------------------------------------------------------------
+_R8_DF=None
+_R8_CTX=None
+df=ctx=T=O=H=L=C=N=D=W=de=b5=b15=b30=d15m=None
+def _r8_prepare_runtime(df_in):
+    global _R8_DF,_R8_CTX,df,ctx,T,O,H,L,C,N,D,W,de,b5,b15,b30,d15m
+    df=df_in
+    ctx=_r7_common_context(df); ctx['df']=df
+    _R8_DF=df; _R8_CTX=ctx
+    T,O,H,L,C,N,D,W,de=ctx['T'],ctx['O'],ctx['H'],ctx['L'],ctx['C'],ctx['N'],ctx['D'],ctx['W'],ctx['day_end']
+    b5,b15,b30=ctx['b5'],ctx['b15'],ctx['b30']; d15m=ctx['d15_m']
+
+R8_RULES={
+ 'R8_1_REARM':dict(direction='LONG',expansion_min=1.90,body_min=.60,ema15_gap_norm_min=.05,breakout_extension_min=.05,prior3_compression_max=1.00,week=(-20.,-8.),loss_streak=(1,4),max_per_day=2,target=20.,max_hold_min=20,initial_stop=10.,be_mfe=10.,lock_mfe=20.,lock_points=5.),
+ 'R8_2_15M_LONG_SHORT_CHILD':dict(direction='LONG',impulse15_expansion_min=1.90,impulse15_body_min=.70,impulse15_prior_breakout_bars=4,confirm5_window_min=30,week=(-30.,-8.),loss_streak=(1,4),max_per_day=1,target=20.,initial_stop=10.,be_mfe=15.,lock_mfe=20.,lock_points=5.),
+ 'R8_SHADOW_LONG':dict(direction='LONG',expansion_min=2.0,body_min=.80,ema15_gap_norm_min=.10,breakout_extension_min=.05,week=(-30.,-8.),loss_streak=(2,4),shadow_proof=10.,shadow_fail=10.,proof_window_min=45,target=25.,initial_stop=10.,be_mfe=12.,lock_mfe=20.,lock_points=5.),
+ 'R8_5_GAP_OR30':dict(direction='LONG',gap_pct_min=.42,entry_time=('10:15','12:30'),expansion_min=1.30,body_abs_min=.60,breakout_extension_min=.15,week=(-20.,20.),loss_streak=(0,4),target=20.,initial_stop=10.,be_mfe=10.,lock_mfe=15.,lock_points=5.),
+ 'R8_OPENING_DRIVE_SHORT':dict(direction='SHORT',first15_expansion_min=1.70,first15_body_abs_min=.70,entry_time=('09:30','11:00'),confirm5_expansion_min=1.10,confirm5_body_min=.50,breakout_extension_min=.02,week=(-50.,100.),target=100.,max_hold_min=30,initial_stop=10.,be_mfe=10.,lock_mfe=15.,lock_points=5.),
+ 'R8_PULLBACK_RECLAIM_HQ':dict(initial_expansion_min=1.40,initial_body_abs_min=.80,prior3_compression_max=1.20,pullback_points=20.,reclaim_body=.60,reclaim_wait_bars=3,target=40.,max_hold_min=20,initial_stop=10.,be_mfe=15.,lock_mfe=30.,lock_points=5.),
+ 'R8_COUNTERSWING_RECLAIM':dict(direction='SHORT',time=('09:45','14:30'),lookback_5m=5,countermove_min=40.,body_min=.65,expansion_min=1.50,break_prior_bars=2,ema15_aligned=True,target=60.,max_hold_min=15,initial_stop=10.,be_mfe=15.,lock_mfe=30.,lock_points=5.),
+ 'R8_LATE_COUNTER_RECLAIM':dict(direction='SHORT',time=('14:00','14:30'),lookback_5m=5,countermove_min=30.,body_min=.65,expansion_min=1.50,break_prior_bars=1,ema15_gap_norm_max=.15,target=40.,max_hold_min=15,initial_stop=10.,be_mfe=15.,lock_mfe=30.,lock_points=5.),
+ 'R8_MIDDAY_LONG_TRANSITION':dict(direction='LONG',time=('11:00','12:30'),lookback_5m=4,countermove_min=30.,body_min=.65,expansion_min=2.0,break_prior_bars=1,ema15_gap_norm_max=.15,target=40.,max_hold_min=20,initial_stop=10.,be_mfe=15.,lock_mfe=30.,lock_points=5.),
+ 'R8_LATE_LONG_TRANSITION':dict(direction='LONG',time=('14:00','14:30'),lookback_5m=6,countermove_min=40.,body_min=.75,expansion_min=2.0,break_prior_bars=1,target=40.,max_hold_min=15,initial_stop=10.,be_mfe=15.,lock_mfe=30.,lock_points=5.),
+}
+
+def _r8_combine(base,*zs):
+ parts=[base[['Module','Direction','Entry_Time','Exit_Time','Points']].copy()]
+ for z in zs:
+  if z is not None and len(z):parts.append(z[['Module','Direction','Entry_Time','Exit_Time','Points']].copy())
+ q=pd.concat(parts,ignore_index=True);q.Entry_Time=pd.to_datetime(q.Entry_Time);q.Exit_Time=pd.to_datetime(q.Exit_Time);return q.sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+def _r8_frame(name,rows):return pd.DataFrame([{'Module':name,'Direction':'LONG' if d==1 else 'SHORT','Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(pp)} for ei,xi,d,pp in rows])
+
+def _r8_active_modules(base, i):
+ t=pd.Timestamp(T[i]);q=base[(base.Entry_Time<=t)&(base.Exit_Time>=t)];return set(q.Module.astype(str))
+
+def _r8_layer1(base):
+ st=_r7_state(df,base,False);used=np.zeros(int(D.max())+1,np.int8);busy=-1;rows=[]
+ for r in ctx['cand']:
+  ei=int(r[0]);mn=int(r[7]);dd=int(D[ei])
+  if int(r[1])!=1 or r[2]<1.90 or r[3]<.60 or r[4]<.05 or r[6]<.05 or r[8]>1.0:continue
+  if 765<=mn<840 or mn>=870 or ei<=busy or st['occ'][ei] or used[dd]>=2:continue
+  if not(-20<=st['live_week'][ei]<=-8) or not(1<=st['lsarr'][ei]<=4):continue
+  zend=min(int(de[ei]),ei+20);ep=float(O[ei]);mfe=0.;xp=float(C[zend]);xi=zend
+  for j in range(ei,zend+1):
+   if j>ei and st['bst'][j]:xp=float(O[j]);xi=j;break
+   floor=-10.;
+   if mfe>=10:floor=0.
+   if mfe>=20:floor=5.
+   sl=ep+floor
+   if O[j]<=sl:xp=float(O[j]);xi=j;break
+   if L[j]<=sl:xp=float(sl);xi=j;break
+   if H[j]>=ep+20:xp=ep+20;xi=j;break
+   mfe=max(mfe,float(H[j]-ep))
+  rows.append((ei,xi,1,xp-ep));busy=xi;used[dd]+=1
+ return _r8_frame('R8_1_REARM',rows)
+
+def _r8_layer2(base):
+ st=_r7_state(df,base,False);li5=b5.last_idx.to_numpy(int);bc5=b5.close.to_numpy(float);rh5=b5.rh4.to_numpy(float);e55=b5.e5.to_numpy(float);e105=b5.e10.to_numpy(float);cnt5=b5.cnt.to_numpy(int)
+ strong=[]
+ for q,r in b15.iterrows():
+  if int(r.cnt)>=15 and np.isfinite(r.exp) and r.exp>=1.9 and r.bodyr>=.7 and r.e5>r.e10 and np.isfinite(r.rh4) and r.close>r.rh4:strong.append(int(r.last_idx))
+ E=[]
+ for s in strong:
+  a=np.searchsorted(li5,s,'left');z=np.searchsorted(li5,s+30,'right')
+  for q5 in range(a,z):
+   ei=int(li5[q5])+1
+   if ei>=N or D[ei]!=D[int(li5[q5])] or cnt5[q5]<5:continue
+   if e55[q5]>e105[q5] and np.isfinite(rh5[q5]) and bc5[q5]>rh5[q5]:E.append(ei);break
+ used=set();rows=[]
+ for ei in sorted(set(E)):
+  dd=int(D[ei]);mn=pd.Timestamp(T[ei]).hour*60+pd.Timestamp(T[ei]).minute
+  if dd in used or st['occ'][ei] or not(600<=mn<=915) or not(-30<=st['live_week'][ei]<=-8) or not(1<=st['lsarr'][ei]<=4):continue
+  ep=float(O[ei]);mfe=0.;zend=int(de[ei]);xp=float(C[zend]);xi=zend
+  for j in range(ei,zend+1):
+   if j>ei and st['bst'][j]:xp=float(O[j]);xi=j;break
+   if j>ei and d15m[j]!=0 and d15m[j]!=1:xp=float(O[j]);xi=j;break
+   floor=-10.
+   if mfe>=15:floor=0.
+   if mfe>=20:floor=5.
+   sl=ep+floor
+   if O[j]<=sl:xp=float(O[j]);xi=j;break
+   if L[j]<=sl:xp=float(sl);xi=j;break
+   if H[j]>=ep+20:xp=ep+20;xi=j;break
+   mfe=max(mfe,float(H[j]-ep))
+  rows.append((ei,xi,1,xp-ep));used.add(dd)
+ return _r8_frame('R8_2_15M_LONG_SHORT_CHILD',rows)
+
+def _r8_shadow(base):
+ st=_r7_state(df,base,False);rows=[];used=set();busy=-1
+ for r in ctx['cand']:
+  si=int(r[0]);mn=int(r[7]);dd=int(D[si])
+  if int(r[1])!=1 or r[2]<2.0 or r[3]<.80 or r[4]<.10 or r[6]<.05:continue
+  if not(585<=mn<=870) or not(-30<=st['live_week'][si]<=-8) or not(2<=st['lsarr'][si]<=4):continue
+  ep0=float(O[si]);pi=None
+  for j in range(si,min(int(de[si]),si+45)+1):
+   if O[j]<=ep0-10 or L[j]<=ep0-10:break
+   if H[j]>=ep0+10:pi=j;break
+  if pi is None or pi+1>=N or D[pi+1]!=D[si]:continue
+  ei=pi+1
+  mods=_r8_active_modules(base,ei)
+  if mods and mods != {'R8_2_15M_LONG_SHORT_CHILD'}:continue
+  if dd in used or ei<=busy:continue
+  ep=float(O[ei]);mfe=0.;zend=int(de[ei]);xp=float(C[zend]);xi=zend
+  for j in range(ei,zend+1):
+   # Existing protective stop is honored before a same-minute regime handoff.
+   floor=-10.
+   if mfe>=12:floor=0.
+   if mfe>=20:floor=5.
+   sl=ep+floor
+   if O[j]<=sl:xp=float(O[j]);xi=j;break
+   if L[j]<=sl:xp=float(sl);xi=j;break
+   if H[j]>=ep+25:xp=ep+25;xi=j;break
+   if j>ei and st['bst'][j] and 'R8_2_15M_LONG_SHORT_CHILD' not in _r8_active_modules(base,j):xp=float(O[j]);xi=j;break
+   if j>ei and d15m[j]!=0 and d15m[j]!=1:xp=float(O[j]);xi=j;break
+   mfe=max(mfe,float(H[j]-ep))
+  rows.append((ei,xi,1,xp-ep));used.add(dd);busy=xi
+ return _r8_frame('R8_SHADOW_LONG',rows)
+
+def _r8_gap_or30(base):
+ st=_r7_state(df,base,False);x=df.copy();x['date']=x.timestamp.dt.normalize();x['mn']=x.timestamp.dt.hour*60+x.timestamp.dt.minute;last=x.groupby('date').close.last();prev=last.shift(1);f=x[(x.mn>=555)&(x.mn<585)].groupby('date').agg(open=('open','first'),high=('high','max'),low=('low','min'))
+ li15=b15.last_idx.to_numpy(int);mp=np.searchsorted(li15,b5.last_idx.to_numpy(int),side='right')-1;e155=b15.e5.to_numpy(float);e1510=b15.e10.to_numpy(float)
+ E=[];used=set()
+ for q,r in b5.iterrows():
+  si=int(r.last_idx);ei=si+1
+  if ei>=N or D[ei]!=D[si] or int(r.cnt)<5:continue
+  t=pd.Timestamp(T[ei]);date=t.normalize();mn=t.hour*60+t.minute;dd=int(D[ei])
+  if dd in used or not(615<=mn<=750) or date not in f.index or date not in prev.index or pd.isna(prev.loc[date]):continue
+  if (float(f.loc[date,'open'])/float(prev.loc[date])-1)*100 < .42:continue
+  q15=mp[q];rng=float(r['range']);med=float(r['med12']) if pd.notna(r['med12']) else np.nan
+  if q15<0 or not(e155[q15]>e1510[q15]) or not(r.e5>r.e10):continue
+  if not np.isfinite(med) or med<=0 or rng/med<1.30 or abs(float(r.bodyr))<.60:continue
+  ext=(float(r.close)-float(f.loc[date,'high']))/max(rng,1e-9)
+  if float(r.close)<=f.loc[date,'high'] or ext<.15:continue
+  if st['occ'][ei] or not(-20<=st['live_week'][ei]<=20) or not(0<=st['lsarr'][ei]<=4):continue
+  E.append(ei);used.add(dd)
+ rows=[]
+ for ei in E:
+  ep=float(O[ei]);mfe=0.;zend=int(de[ei]);xp=float(C[zend]);xi=zend
+  for j in range(ei,zend+1):
+   # Conservative 1m management: completed minute can arm protection before its low is tested.
+   mfe=max(mfe,float(H[j]-ep));floor=-10.
+   if mfe>=10:floor=0.
+   if mfe>=15:floor=5.
+   sl=ep+floor
+   if O[j]<=sl:xp=float(O[j]);xi=j;break
+   if L[j]<=sl:xp=float(sl);xi=j;break
+   if H[j]>=ep+20:xp=ep+20;xi=j;break
+  rows.append((ei,xi,1,xp-ep))
+ return _r8_frame('R8_5_GAP_OR30',rows)
+
+def _r8_opening_drive(base):
+ st=_r7_state(df,base,False);occ,bst=st['occ'],st['bst'];
+ x=df.copy();x['date']=x.timestamp.dt.normalize();x['min']=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+ f=x[(x['min']>=555)&(x['min']<570)].groupby('date').agg(o=('open','first'),h=('high','max'),l=('low','min'),c=('close','last'));f['range']=f.h-f.l;f['bodyr']=(f.c-f.o)/f['range'].replace(0,np.nan);f['med10']=f['range'].shift(1).rolling(10,min_periods=6).median();f['exp']=f['range']/f.med10
+ li5=b5.last_idx.to_numpy(int);li15=b15.last_idx.to_numpy(int);mp15=np.searchsorted(li15,li5,side='right')-1;D15=np.zeros(len(b5),np.int8);ok=mp15>=0;D15[ok]=np.where(b15.e5.to_numpy()[mp15[ok]]>b15.e10.to_numpy()[mp15[ok]],1,-1)
+ cr=[]
+ for q,r in b5.iterrows():
+  ei=int(r.last_idx)+1
+  if ei>=N or D[ei]!=D[int(r.last_idx)] or int(r.cnt)<5:continue
+  dt=pd.Timestamp(T[ei]);mn=dt.hour*60+dt.minute
+  if not(570<=mn<=660):continue
+  date=dt.normalize()
+  if date not in f.index or not np.isfinite(f.loc[date,'exp']):continue
+  rng=float(r['range']);med=float(r['med12']) if pd.notna(r['med12']) else np.nan
+  if rng<=0 or not np.isfinite(med) or med<=0:continue
+  fr=f.loc[date]
+  if fr.bodyr<0 and float(r.close)<fr.l and D15[q]==-1:
+   d=-1;ext=(fr.l-float(r.close))/rng;body=-float(r.bodyr)
+  else:continue
+  if float(fr.exp)>=1.70 and abs(float(fr.bodyr))>=.70 and rng/med>=1.10 and body>=.50 and ext>=.02:cr.append((ei,d))
+ used=np.zeros(int(D.max())+1,np.int8);rows=[];busy=-1
+ for ei,d in cr:
+  dd=int(D[ei]);ww=int(W[ei]);
+  if ei<=busy or occ[ei] or used[dd]:continue
+  if not(-50<=st['live_week'][ei]<=100):continue
+  zend=min(int(de[ei]),ei+30);ep=float(O[ei]);mfe=0.;xp=float(C[zend]);xi=zend
+  for j in range(ei,zend+1):
+   if j>ei and bst[j]:xp=float(O[j]);xi=j;break
+   floor=-10.
+   if mfe>=10:floor=0.
+   if mfe>=15:floor=5.
+   sl=ep- floor # d=-1 => ep +10 initially, ep at BE, ep-5 lock
+   if O[j]>=sl:xp=float(O[j]);xi=j;break
+   if H[j]>=sl:xp=float(sl);xi=j;break
+   if L[j]<=ep-100:xp=ep-100;xi=j;break
+   mfe=max(mfe,float(ep-L[j]))
+  rows.append((ei,xi,-1,ep-xp));busy=xi;used[dd]=1
+ return _r8_frame('R8_OPENING_DRIVE_SHORT',rows)
+
+def _r8_pullback_hq(base):
+ st=_r7_state(df,base,False);occ,bst=st['occ'],st['bst'];cand=ctx['cand'];li30=b30.last_idx.to_numpy(int);e19=b30.e19.to_numpy(float);e29=b30.e29.to_numpy(float)
+ bo=b5.open.to_numpy(float);bh=b5.high.to_numpy(float);bl=b5.low.to_numpy(float);bc=b5.close.to_numpy(float);bbody=b5.bodyr.to_numpy(float);be5=b5.e5.to_numpy(float);be10=b5.e10.to_numpy(float);last=b5.last_idx.to_numpy(int);cnt=b5.cnt.to_numpy(int)
+ entries=[]
+ for k,r in enumerate(cand):
+  if r[2]<1.4 or r[3]<.80 or r[8]>1.2:continue
+  si=int(r[0]);d=int(r[1]);q=int(r[9]);q30=np.searchsorted(li30,si-1,'right')-1
+  if q30<0 or not((d==1 and e19[q30]>e29[q30]) or (d==-1 and e19[q30]<e29[q30])):continue
+  mn=pd.Timestamp(T[si]).hour*60+pd.Timestamp(T[si]).minute
+  if mn<570 or mn>855:continue
+  sigclose=bc[q];pulled=False
+  for u in range(q+1,min(q+4,len(b5))):
+   if cnt[u]<5 or int(D[last[u]])!=int(D[last[q]]):break
+   if d==1:
+    if sigclose-bl[u]>=20:pulled=True
+    reclaim=pulled and be5[u]>be10[u] and bbody[u]>=.6 and u>q+1 and bc[u]>bh[u-1]
+   else:
+    if bh[u]-sigclose>=20:pulled=True
+    reclaim=pulled and be5[u]<be10[u] and bbody[u]<=-.6 and u>q+1 and bc[u]<bl[u-1]
+   if reclaim:
+    ei=int(last[u])+1
+    if ei<N and D[ei]==D[last[u]]:entries.append((ei,d))
+    break
+ used=np.zeros(int(D.max())+1,np.int8);rows=[];busy=-1
+ for ei,d in sorted(entries):
+  dd=int(D[ei]);mn=pd.Timestamp(T[ei]).hour*60+pd.Timestamp(T[ei]).minute
+  if ei<=busy or occ[ei] or used[dd] or mn>885:continue
+  zend=min(int(de[ei]),ei+20);ep=float(O[ei]);mfe=0.;xp=float(C[zend]);xi=zend
+  for j in range(ei,zend+1):
+   if j>ei and bst[j]:xp=float(O[j]);xi=j;break
+   floor=-10.
+   if mfe>=15:floor=0.
+   if mfe>=30:floor=5.
+   sl=ep+d*floor
+   if d==1:
+    if O[j]<=sl:xp=float(O[j]);xi=j;break
+    if L[j]<=sl:xp=float(sl);xi=j;break
+    if H[j]>=ep+40:xp=ep+40;xi=j;break
+    mfe=max(mfe,float(H[j]-ep))
+   else:
+    if O[j]>=sl:xp=float(O[j]);xi=j;break
+    if H[j]>=sl:xp=float(sl);xi=j;break
+    if L[j]<=ep-40:xp=ep-40;xi=j;break
+    mfe=max(mfe,float(ep-L[j]))
+  rows.append((ei,xi,d,d*(xp-ep)));busy=xi;used[dd]=1
+ return _r8_frame('R8_PULLBACK_RECLAIM_HQ',rows)
+
+def _r8_transition(base,name,direction,lb,prevmove,bmin,expmin,break2,mode,target,cap,startmn,endmn):
+ st=_r7_state(df,base,False);occ,bst=st['occ'],st['bst'];bo=b5.open.to_numpy(float);bh=b5.high.to_numpy(float);bl=b5.low.to_numpy(float);bc=b5.close.to_numpy(float);br=b5['range'].to_numpy(float);body=b5.bodyr.to_numpy(float);last=b5.last_idx.to_numpy(int);cnt=b5.cnt.to_numpy(int);med12=pd.Series(br).rolling(12,min_periods=12).median().shift(1).to_numpy(float);li15=b15.last_idx.to_numpy(int);e5=b15.e5.to_numpy(float);e10=b15.e10.to_numpy(float);r15=b15['range'].to_numpy(float);bd15=b15.bodyr.to_numpy(float)
+ E=[]
+ for q in range(15,len(b5)):
+  if cnt[q]<5 or not np.isfinite(med12[q]) or med12[q]<=0:continue
+  si=int(last[q]);ei=si+1
+  if ei>=N or D[ei]!=D[si] or occ[ei]:continue
+  mn=pd.Timestamp(T[si]).hour*60+pd.Timestamp(T[si]).minute
+  if mn<startmn or mn>endmn:continue
+  d=1 if body[q]>0 else -1 if body[q]<0 else 0
+  if d!=direction:continue
+  q15=np.searchsorted(li15,si,'right')-1
+  if q15<1 or q-lb<0:continue
+  move=d*(bc[q-lb]-bc[q-1]);bod=d*body[q];ex=br[q]/med12[q]
+  ext1=(bc[q]-bh[q-1]) if d==1 else (bl[q-1]-bc[q]);ext2=(bc[q]-max(bh[q-1],bh[q-2])) if d==1 else (min(bl[q-1],bl[q-2])-bc[q])
+  gap=abs(e5[q15]-e10[q15])/(r15[q15] if r15[q15]>0 else np.nan);align=1 if e5[q15]>e10[q15] else -1
+  if move<prevmove or bod<bmin or ex<expmin:continue
+  if (ext2 if break2 else ext1)<0:continue
+  if mode==1 and align!=d:continue
+  if mode==2 and gap>.15:continue
+  if mode==3 and d*bd15[q15]<.4:continue
+  E.append((ei,d))
+ used=np.zeros(int(D.max())+1,np.int8);rows=[];busy=-1
+ for ei,d in sorted(E):
+  dd=int(D[ei]);
+  if ei<=busy or occ[ei] or used[dd]:continue
+  zend=min(int(de[ei]),ei+cap);ep=float(O[ei]);mfe=0.;xp=float(C[zend]);xi=zend
+  for j in range(ei,zend+1):
+   if j>ei and bst[j]:xp=float(O[j]);xi=j;break
+   floor=-10.
+   if mfe>=15:floor=0.
+   if mfe>=30:floor=5.
+   sl=ep+d*floor
+   if d==1:
+    if O[j]<=sl:xp=float(O[j]);xi=j;break
+    if L[j]<=sl:xp=float(sl);xi=j;break
+    if H[j]>=ep+target:xp=ep+target;xi=j;break
+    mfe=max(mfe,float(H[j]-ep))
+   else:
+    if O[j]>=sl:xp=float(O[j]);xi=j;break
+    if H[j]>=sl:xp=float(sl);xi=j;break
+    if L[j]<=ep-target:xp=ep-target;xi=j;break
+    mfe=max(mfe,float(ep-L[j]))
+  rows.append((ei,xi,d,d*(xp-ep)));busy=xi;used[dd]=1
+ return _r8_frame(name,rows)
+
+
+
+# -----------------------------------------------------------------------------
+# R9-15 reconstructed short-child extensions.
+# Recovered/rebuilt from the live-causal R9 research branch.  These rules use
+# ONLY runtime features computed from the raw minute input and the already
+# generated R8 base state.  No historical trade rows, dates or P&L ledgers are
+# embedded.  All signals are based on completed bars and entries fill at the
+# next regular-session 1-minute open.
+# -----------------------------------------------------------------------------
+R9_RULES = [
+    # LIVE-FIT CORE: only broad families that stayed positive as a combined
+    # layer across every calendar year 2015-2026 in robustness audit.
+    # These are causal runtime conditions, not historical date filters.
+    ('S1','t50c15', [('precomp5','>=',2.0),('comp15_1','>=',2.0),('ext15_1','>=',0.0)]),
+    ('S2','t60c15', [('comp15_3','>=',3.0),('exp15','>=',1.2),('last_base_p','<=',-10.0)]),
+    ('S6','t20c10', [('exp5','>=',6.0),('precomp5','<=',1.2)]),
+]
+
+_R9_MANAGERS = {
+    't20c10': dict(target=20.0, cap=10, be_mfe=10.0, lock_mfe=20.0, lock_points=5.0),
+    't25c10': dict(target=25.0, cap=10, be_mfe=10.0, lock_mfe=20.0, lock_points=5.0),
+    't30c15': dict(target=30.0, cap=15, be_mfe=15.0, lock_mfe=25.0, lock_points=5.0),
+    't40c15': dict(target=40.0, cap=15, be_mfe=15.0, lock_mfe=30.0, lock_points=5.0),
+    't50c15': dict(target=50.0, cap=15, be_mfe=15.0, lock_mfe=30.0, lock_points=5.0),
+    't60c15': dict(target=60.0, cap=15, be_mfe=15.0, lock_mfe=30.0, lock_points=5.0),
+}
+
+
+def _r9_feature_frame(base):
+    """Build causal candidate features from completed 5m/15m/30m bars."""
+    st=_r7_state(df,base,False)
+    cand=ctx['cand']; occ=st['occ']; lw=st['live_week']; ld=st['live_day']
+    li5=ctx['li5']; li15=ctx['li15']; li30=ctx['li30']
+    last5=b5.last_idx.to_numpy(int); rng5=b5['range'].to_numpy(float); med12=b5.med12.to_numpy(float); body5a=b5.bodyr.to_numpy(float); e55=b5.e5.to_numpy(float); e105=b5.e10.to_numpy(float); bc5=b5.close.to_numpy(float); bh5=b5.high.to_numpy(float); bl5=b5.low.to_numpy(float)
+    last15=b15.last_idx.to_numpy(int); rng15=b15['range'].to_numpy(float); med8=b15.med8.to_numpy(float); body15a=b15.bodyr.to_numpy(float); e515=b15.e5.to_numpy(float); e1015=b15.e10.to_numpy(float); bc15=b15.close.to_numpy(float); bh15=b15.high.to_numpy(float); bl15=b15.low.to_numpy(float)
+    e19=b30.e19.to_numpy(float); e29=b30.e29.to_numpy(float); last30=b30.last_idx.to_numpy(int)
+
+    # Most recently REALIZED R8 trade, mapped causally to each minute.
+    be=np.searchsorted(T,pd.to_datetime(base.Exit_Time).to_numpy('datetime64[ns]'),side='left')
+    oo=np.argsort(be,kind='stable'); be=be[oo]
+    bp=base.Points.to_numpy(float)[oo]
+    bd=np.where(base.Direction.to_numpy()[oo]=='LONG',1,-1)
+    ptr=np.searchsorted(be,np.arange(N),side='right')-1
+
+    rows=[]
+    for r in cand:
+        ei=int(r[0]); d=int(r[1]); q5=int(r[9])
+        if ei>=N or occ[ei] or D[ei]!=D[ei-1]:
+            continue
+        q15=np.searchsorted(last15,ei-1,side='right')-1
+        q30=np.searchsorted(last30,ei-1,side='right')-1
+        if q15<3 or q30<1:
+            continue
+        pi=int(ptr[ei])
+        if pi<0:
+            continue
+        p0=float(bp[pi]); p1=float(bp[pi-1]) if pi>=1 else np.nan; p2=float(bp[pi-2]) if pi>=2 else np.nan
+        pd0=int(bd[pi]); mins_since=ei-int(be[pi]) if be[pi]>=0 else 9999
+        parent30=1 if e19[q30]>e29[q30] else -1
+        align15=1 if e515[q15]>e1015[q15] else -1
+        def rr(k):
+            return rng15[k]/med8[k] if k>=0 and np.isfinite(med8[k]) and med8[k]>0 else np.nan
+        c1,c2,c3=rr(q15-1),rr(q15-2),rr(q15-3)
+        cur15=rr(q15)
+        ext15_1=(bc15[q15]-bh15[q15-1]) if d==1 else (bl15[q15-1]-bc15[q15])
+        ext15_2=(bc15[q15]-max(bh15[q15-1],bh15[q15-2])) if d==1 else (min(bl15[q15-1],bl15[q15-2])-bc15[q15])
+        exp5=float(r[2]); b5abs=float(r[3]); g15=float(r[4]); gr=float(r[5]); br5=float(r[6]); mn=int(r[7]); precomp=float(r[8]); first19=int(r[10]); since19=int(r[11])
+        move3=d*(bc5[q5-3]-bc5[q5-1]) if q5>=3 else np.nan
+        move5=d*(bc5[q5-5]-bc5[q5-1]) if q5>=5 else np.nan
+        den=med12[q5] if np.isfinite(med12[q5]) and med12[q5]>0 else np.nan
+        dist15=d*(bc5[q5]-e1015[q15])/den
+        dist30=d*(bc5[q5]-e29[q30])/den
+        rows.append((ei,d,q5,q15,q30,exp5,b5abs,g15,gr,br5,mn,precomp,first19,since19,parent30,align15,p0,p1,p2,pd0,int(pd0==d),mins_since,lw[ei],ld[ei],c1,c2,c3,cur15,abs(body15a[q15]),ext15_1,ext15_2,move3,move5,dist15,dist30))
+    cols=['ei','d','q5','q15','q30','exp5','body5','gapn15','gapratio15','br5','mn','precomp5','first19','since19','parent30','align15','last_base_p','prev_base_p','prev2_base_p','last_base_d','same_last_dir','mins_since_base','week_p','day_p','comp15_1','comp15_2','comp15_3','exp15','body15','ext15_1','ext15_2','move3','move5','dist15','dist30']
+    return pd.DataFrame(rows,columns=cols), st
+
+
+def _r9_mask(F,conds):
+    m=np.ones(len(F),dtype=bool)
+    for col,op,v in conds:
+        a=F[col].to_numpy(float)
+        if op=='>=': m &= a>=v
+        elif op=='>': m &= a>v
+        elif op=='<=': m &= a<=v
+        elif op=='<': m &= a<v
+        elif op=='==': m &= a==v
+        else: raise ValueError(op)
+    return m
+
+
+def _r9_sim_one(ei,d,st,mgr):
+    """Conservative 1m manager. MFE protection becomes active only after the
+    minute that created the MFE has completed, avoiding same-minute leakage."""
+    ep=float(O[ei]); zend=min(int(de[ei]),ei+int(mgr['cap']))
+    nb=int(st['nextbst'][ei])
+    if nb>ei and nb<zend:
+        zend=nb
+    mfe=0.; xp=float(C[zend]); xi=zend
+    for j in range(ei,zend+1):
+        if j>ei and st['bst'][j]:
+            xp=float(O[j]); xi=j; break
+        floor=-10.0
+        if mfe>=mgr['be_mfe']: floor=0.0
+        if mfe>=mgr['lock_mfe']: floor=mgr['lock_points']
+        sl=ep+d*floor
+        if d==1:
+            if O[j]<=sl: xp=float(O[j]); xi=j; break
+            if L[j]<=sl: xp=float(sl); xi=j; break
+            if H[j]>=ep+mgr['target']: xp=ep+mgr['target']; xi=j; break
+            mfe=max(mfe,float(H[j]-ep))
+        else:
+            if O[j]>=sl: xp=float(O[j]); xi=j; break
+            if H[j]>=sl: xp=float(sl); xi=j; break
+            if L[j]<=ep-mgr['target']: xp=ep-mgr['target']; xi=j; break
+            mfe=max(mfe,float(ep-L[j]))
+    return xi,float(d*(xp-ep))
+
+
+def _r9_layer(base):
+    F,st=_r9_feature_frame(base)
+    proposals=[]
+    for name,tag,conds in R9_RULES:
+        mgr=_R9_MANAGERS[tag]
+        for j in np.flatnonzero(_r9_mask(F,conds)):
+            ei=int(F.ei.iloc[j]); d=int(F.d.iloc[j])
+            xi,pp=_r9_sim_one(ei,d,st,mgr)
+            proposals.append((ei,xi,name,pp,int(j),d))
+    # Deterministic live arbitration.  Earliest signal wins; if multiple rules
+    # signal on the same open, the one with the shorter realized child path is
+    # evaluated first, then stable rule name.  R9 children never overlap.
+    proposals.sort(key=lambda z:(z[0],z[1],z[2]))
+    rows=[]; busy=-1; seen=set(); c_days=set()
+    for ei,xi,name,pp,j,d in proposals:
+        day=int(D[ei])
+        if ei in seen or ei<=busy:
+            continue
+        # DD/overtrading guard recovered during R9-15 reconstruction: at most
+        # one strong-week continuation child per trading day.
+        if name=='C_STRONG_WEEK_CONT' and day in c_days:
+            continue
+        rows.append({'Module':'R9R_'+name,'Direction':'LONG' if d==1 else 'SHORT','Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(pp)})
+        seen.add(ei); busy=xi
+        if name=='C_STRONG_WEEK_CONT': c_days.add(day)
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+
+def _lf15_exp_ret_child(base):
+    """Sparse live-fit 15m expansion/return child.
+
+    Rules use completed bars only and fill at the next regular-session 1m open.
+    The child is strictly subordinate to the existing R stream: it may enter
+    only while the base engine is flat and exits immediately if a normal R
+    entry starts later. At most one child per trading day.
+    """
+    st0=_r7_state(df,base,False)
+    x=df[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    # Completed 15m bars.
+    mm=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+    q=x.copy();q['day']=q.timestamp.dt.normalize();q['bucket']=((mm-555)//15).astype(int);q['idx']=np.arange(len(q))
+    z=q.groupby(['day','bucket'],sort=False).agg(last=('idx','last'),ts=('timestamp','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),cnt=('idx','size')).reset_index()
+    z['rng']=z.high-z.low;z['e5']=z.close.ewm(span=5,adjust=False).mean();z['e10']=z.close.ewm(span=10,adjust=False).mean();z['med12']=z.rng.shift(1).rolling(12,min_periods=6).median();z['c5']=z.groupby('day').close.shift(5)
+    # Completed 30m bars for normalized parent gap.
+    q=x.copy();mm2=q.timestamp.dt.hour*60+q.timestamp.dt.minute;q['day']=q.timestamp.dt.normalize();q['bucket']=((mm2-555)//30).astype(int);q['idx']=np.arange(len(q))
+    z30=q.groupby(['day','bucket'],sort=False).agg(last=('idx','last'),ts=('timestamp','last'),high=('high','max'),low=('low','min'),close=('close','last')).reset_index()
+    z30['rng']=z30.high-z30.low;z30['e19']=z30.close.ewm(span=19,adjust=False).mean();z30['e29']=z30.close.ewm(span=29,adjust=False).mean();z30['med6']=z30.rng.shift(1).rolling(6,min_periods=3).median()
+    tt30=z30.ts.to_numpy(dtype='datetime64[ns]'); q30=np.searchsorted(tt30,z.ts.to_numpy(dtype='datetime64[ns]'),side='right')-1
+    rows=[];used=set();day_starts=np.r_[0,np.flatnonzero(D[1:]!=D[:-1])+1].astype(int)
+    for qi,r in z.iterrows():
+        ei=int(r['last'])+1
+        if ei>=N or int(r['cnt'])<15: continue
+        et=pd.Timestamp(T[ei]);mn=et.hour*60+et.minute
+        if mn<585 or mn>885: continue
+        if st0['occ'][ei]: continue
+        dd=int(D[ei])
+        if dd in used: continue
+        if not np.isfinite(r.med12) or float(r.med12)<=0 or pd.isna(r.c5): continue
+        d=1 if float(r.e5)>float(r.e10) else -1 if float(r.e5)<float(r.e10) else 0
+        if d==0: continue
+        k=int(q30[qi])
+        if k<0 or not np.isfinite(z30.med6.iloc[k]) or float(z30.med6.iloc[k])<=0: continue
+        gap30=d*float(z30.e19.iloc[k]-z30.e29.iloc[k])/float(z30.med6.iloc[k])
+        exp15=float(r.rng)/float(r.med12)
+        ret5=d*(float(r.close)/float(r.c5)-1.0)*10000.0
+        # Directional session location through the completed 15m bar.
+        s=int(day_starts[dd]); cur=int(r['last'])
+        if cur<s: continue
+        hi=float(np.max(H[s:cur+1])); lo=float(np.min(L[s:cur+1])); rg=max(hi-lo,1e-9);loc=(float(r.close)-lo)/rg; dloc=loc if d==1 else 1.0-loc
+        if gap30>0.50 or exp15<2.40 or ret5<35.0 or dloc<0.90: continue
+        ep=float(O[ei]);zend=min(int(de[ei]),ei+60);mfe=0.;xp=float(C[zend]);xi=zend;reason='TIME'
+        for j in range(ei,zend+1):
+            if j>ei and st0['bst'][j]: xp=float(O[j]);xi=j;reason='R_PRIORITY';break
+            floor=-10.0
+            if mfe>=15.0: floor=0.0
+            if mfe>=30.0: floor=5.0
+            sl=ep+d*floor
+            if d==1:
+                if O[j]<=sl: xp=float(O[j]);xi=j;reason='STOP_GAP';break
+                if L[j]<=sl: xp=float(sl);xi=j;reason='STOP';break
+                if H[j]>=ep+50.0: xp=ep+50.0;xi=j;reason='TARGET';break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl: xp=float(O[j]);xi=j;reason='STOP_GAP';break
+                if H[j]>=sl: xp=float(sl);xi=j;reason='STOP';break
+                if L[j]<=ep-50.0: xp=ep-50.0;xi=j;reason='TARGET';break
+                mfe=max(mfe,float(ep-L[j]))
+        rows.append({'Module':'R9LF_15M_EXP_RET_CHILD','Direction':'LONG' if d==1 else 'SHORT','Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(d*(xp-ep))})
+        used.add(dd)
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+def _lf15_comp_child(base):
+    """Second sparse live-fit 15m child, orthogonal to LF1.
+
+    It requires a strong completed 15m expansion after a relatively contained
+    prior three-bar range.  The existing LF1/R stream has strict priority.
+    Rules are runtime-only and use no historical rows or future labels.
+    """
+    st0=_r7_state(df,base,False)
+    x=df[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    mm=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+    q=x.copy();q['day']=q.timestamp.dt.normalize();q['bucket']=((mm-555)//15).astype(int);q['idx']=np.arange(len(q))
+    z=q.groupby(['day','bucket'],sort=False).agg(last=('idx','last'),ts=('timestamp','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),cnt=('idx','size')).reset_index()
+    z['rng']=z.high-z.low;z['e5']=z.close.ewm(span=5,adjust=False).mean();z['e10']=z.close.ewm(span=10,adjust=False).mean();z['med12']=z.rng.shift(1).rolling(12,min_periods=6).median();z['c5']=z.groupby('day').close.shift(5)
+    z['prev3_rng']=z.groupby('day').rng.transform(lambda a:a.shift(1).rolling(3,min_periods=3).median())
+    q=x.copy();mm2=q.timestamp.dt.hour*60+q.timestamp.dt.minute;q['day']=q.timestamp.dt.normalize();q['bucket']=((mm2-555)//30).astype(int);q['idx']=np.arange(len(q))
+    z30=q.groupby(['day','bucket'],sort=False).agg(last=('idx','last'),ts=('timestamp','last'),high=('high','max'),low=('low','min'),close=('close','last')).reset_index()
+    z30['rng']=z30.high-z30.low;z30['e19']=z30.close.ewm(span=19,adjust=False).mean();z30['e29']=z30.close.ewm(span=29,adjust=False).mean();z30['med6']=z30.rng.shift(1).rolling(6,min_periods=3).median()
+    tt30=z30.ts.to_numpy(dtype='datetime64[ns]'); q30=np.searchsorted(tt30,z.ts.to_numpy(dtype='datetime64[ns]'),side='right')-1
+    rows=[];used=set()
+    for qi,r in z.iterrows():
+        ei=int(r['last'])+1
+        if ei>=N or int(r['cnt'])<15: continue
+        et=pd.Timestamp(T[ei]);mn=et.hour*60+et.minute
+        if mn<585 or mn>885: continue
+        if st0['occ'][ei]: continue
+        dd=int(D[ei])
+        if dd in used: continue
+        if not np.isfinite(r.med12) or float(r.med12)<=0 or pd.isna(r.c5) or pd.isna(r.prev3_rng): continue
+        d=1 if float(r.e5)>float(r.e10) else -1 if float(r.e5)<float(r.e10) else 0
+        if d==0: continue
+        k=int(q30[qi])
+        if k<0 or not np.isfinite(z30.med6.iloc[k]) or float(z30.med6.iloc[k])<=0: continue
+        gap30=d*float(z30.e19.iloc[k]-z30.e29.iloc[k])/float(z30.med6.iloc[k])
+        exp15=float(r.rng)/float(r.med12)
+        ret5=d*(float(r.close)/float(r.c5)-1.0)*10000.0
+        comp3=float(r.prev3_rng)/float(r.med12)
+        if gap30>0.40 or exp15<2.20 or ret5<40.0 or comp3>1.20: continue
+        ep=float(O[ei]);zend=min(int(de[ei]),ei+60);mfe=0.;xp=float(C[zend]);xi=zend
+        for j in range(ei,zend+1):
+            if j>ei and st0['bst'][j]: xp=float(O[j]);xi=j;break
+            floor=-10.0
+            if mfe>=15.0: floor=0.0
+            if mfe>=30.0: floor=5.0
+            sl=ep+d*floor
+            if d==1:
+                if O[j]<=sl: xp=float(O[j]);xi=j;break
+                if L[j]<=sl: xp=float(sl);xi=j;break
+                if H[j]>=ep+50.0: xp=ep+50.0;xi=j;break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl: xp=float(O[j]);xi=j;break
+                if H[j]>=sl: xp=float(sl);xi=j;break
+                if L[j]<=ep-50.0: xp=ep-50.0;xi=j;break
+                mfe=max(mfe,float(ep-L[j]))
+        rows.append({'Module':'R9LF_15M_COMP_EXP_CHILD','Direction':'LONG' if d==1 else 'SHORT','Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(d*(xp-ep))})
+        used.add(dd)
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+def _lf5_fresh_pullback_child(base):
+    """Sparse same-session 5m pullback-resumption child.
+
+    Parent direction is the completed 15m EMA5/10 state.  A temporary opposite
+    5m EMA5/21 state marks the pullback.  Entry is allowed only after enough
+    same-session 5m history exists (09:45 onward), after directional impulse,
+    controlled pullback and fresh resumption.  Existing R/LF trades always
+    have priority; max one paid child per trading day.
+    """
+    st0=_r7_state(df,base,False)
+    x=df[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    mm=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+    q=x.copy();q['day']=q.timestamp.dt.normalize();q['bucket']=((mm-555)//5).astype(int);q['idx']=np.arange(len(q))
+    z=q.groupby(['day','bucket'],sort=False).agg(last=('idx','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),cnt=('idx','size')).reset_index()
+    z['rng']=z.high-z.low
+    z['med20']=z.rng.rolling(20,min_periods=10).median()
+    z['bodyrat']=(z.close-z.open).abs()/z.rng.replace(0,np.nan)
+    z['e5']=z.close.ewm(span=5,adjust=False).mean();z['e21']=z.close.ewm(span=21,adjust=False).mean();z['d5']=np.sign(z.e5-z.e21)
+    # completed 15m parent direction, mapped to each completed 5m bar
+    q15=x.copy();q15['day']=q15.timestamp.dt.normalize();q15['bucket15']=((mm-555)//15).astype(int);q15['idx']=np.arange(len(q15))
+    a15=q15.groupby(['day','bucket15'],sort=False).agg(close=('close','last')).reset_index()
+    a15['e5_15']=a15.close.ewm(span=5,adjust=False).mean();a15['e10_15']=a15.close.ewm(span=10,adjust=False).mean();a15['d15']=np.sign(a15.e5_15-a15.e10_15)
+    z['bucket15']=(z['bucket']//3).astype(int)
+    z=z.merge(a15[['day','bucket15','d15']],on=['day','bucket15'],how='left',sort=False)
+    # sequence features; entry>=09:45 ensures all five lagged bars are from same session
+    z['imp']=z.close.shift(2)-z.close.shift(5)
+    z['pb']=z.close.shift(1)-z.close.shift(2)
+    z['curret']=z.close-z.close.shift(1)
+    rows=[];used=set()
+    for r in z.itertuples(index=False):
+        ei=int(r.last)+1
+        if ei>=N or int(r.cnt)<5: continue
+        et=pd.Timestamp(T[ei]);mn=et.hour*60+et.minute
+        if mn<585 or mn>660: continue
+        dd=int(D[ei])
+        if dd in used or st0['occ'][ei]: continue
+        if not np.isfinite(r.med20) or float(r.med20)<=0 or pd.isna(r.d15) or pd.isna(r.d5): continue
+        d=int(r.d15)
+        if d==0 or int(r.d5)==d: continue
+        den=d*float(r.imp)
+        if not np.isfinite(den) or den<=0: continue
+        impn=den/float(r.med20)
+        pbrat=(-d*float(r.pb))/den
+        curn=(d*float(r.curret))/float(r.med20)
+        if impn<0.50 or pbrat<=0 or pbrat>1.50 or curn<0.50 or float(r.bodyrat)<0.25: continue
+        ep=float(O[ei]);zend=min(int(de[ei]),ei+60);mfe=0.;xp=float(C[zend]);xi=zend
+        for j in range(ei,zend+1):
+            if j>ei and st0['bst'][j]: xp=float(O[j]);xi=j;break
+            floor=-10.0
+            if mfe>=15.0: floor=0.0
+            if mfe>=30.0: floor=5.0
+            sl=ep+d*floor
+            if d==1:
+                if O[j]<=sl: xp=float(O[j]);xi=j;break
+                if L[j]<=sl: xp=float(sl);xi=j;break
+                if H[j]>=ep+50.0: xp=ep+50.0;xi=j;break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl: xp=float(O[j]);xi=j;break
+                if H[j]>=sl: xp=float(sl);xi=j;break
+                if L[j]<=ep-50.0: xp=ep-50.0;xi=j;break
+                mfe=max(mfe,float(ep-L[j]))
+        rows.append({'Module':'R9LF_5M_FRESH_PULLBACK_CHILD','Direction':'LONG' if d==1 else 'SHORT','Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(d*(xp-ep))})
+        used.add(dd)
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+
+def _daily50_parent_pull_70(base):
+    """Causal red-day parent-trend pullback rescue.
+
+    Rules (all information available before entry):
+    - completed 15m and 30m EMA5/10 directions aligned
+    - completed 5m EMA5/21 temporarily countertrend to the parent
+    - live realized base day P&L strictly before entry in [-25,-15]
+    - 30m EMA5/10 separation / prior 30m median range >= 0.15
+    - directional session location <= 0.60 (not already stretched)
+    - directional 3-bar 5m return normalized by prior median range >= -0.50
+    - same-session only, entries from 09:45 through 14:31-ish candidate window
+    - max one rescue child/day; base engine has priority and pre-empts at its next entry
+    - -10 initial stop, BE after +15 MFE, +5 lock after +30 MFE, +70 target, max 90m
+    """
+    st=_r7_state(df,base,False)
+    x=df[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    mm=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+    x['date']=x.timestamp.dt.date
+    x['mod']=mm
+    x['idx']=np.arange(len(x))
+    def _bars(tf):
+        q=x.copy(); q['bucket']=((q['mod']-555)//tf).astype(int)
+        z=q.groupby(['date','bucket'],sort=False).agg(
+            first_idx=('idx','first'),last_idx=('idx','last'),open=('open','first'),
+            high=('high','max'),low=('low','min'),close=('close','last'),cnt=('idx','size')).reset_index()
+        z['range']=z.high-z.low
+        z['e5']=z.close.ewm(span=5,adjust=False).mean()
+        z['e10']=z.close.ewm(span=10,adjust=False).mean()
+        z['e21']=z.close.ewm(span=21,adjust=False).mean()
+        z['medr']=z['range'].shift(1).rolling(20,min_periods=5).median()
+        z['end_ts']=[pd.Timestamp(T[int(i)]) for i in z.last_idx]
+        return z
+    b5x=_bars(5); b15x=_bars(15); b30x=_bars(30)
+    # prior 5m fields
+    b5x['d5']=np.sign(b5x.e5-b5x.e21).replace(0,np.nan).ffill().fillna(0).astype(int)
+    b5x['ret3']=b5x.close-b5x.close.shift(3)
+    # parent completed-bar direction and 30m gap strength
+    b15x['d15']=np.sign(b15x.e5-b15x.e10).replace(0,np.nan).ffill().fillna(0).astype(int)
+    b30x['d30']=np.sign(b30x.e5-b30x.e10).replace(0,np.nan).ffill().fillna(0).astype(int)
+    b30x['gap30']=abs(b30x.e5-b30x.e10)/b30x.medr
+    h15=b15x[['end_ts','d15']].sort_values('end_ts')
+    h30=b30x[['end_ts','d30','gap30']].sort_values('end_ts')
+    bf=pd.merge_asof(b5x.sort_values('end_ts'),h15,on='end_ts',direction='backward',allow_exact_matches=True)
+    bf=pd.merge_asof(bf,h30,on='end_ts',direction='backward',allow_exact_matches=True)
+    # base realized P&L strictly before candidate timestamp (matches research harness)
+    b=base.copy(); b['Entry_Time']=pd.to_datetime(b.Entry_Time); b['Exit_Time']=pd.to_datetime(b.Exit_Time)
+    byday={}
+    for dd,g in b.groupby(b.Exit_Time.dt.date):
+        gg=g.sort_values('Exit_Time'); byday[dd]=(gg.Exit_Time.astype('int64').to_numpy(),np.cumsum(gg.Points.to_numpy(float)))
+    base_entries=np.sort(st['ent'])
+    # session running location arrays
+    sess_hi=x.groupby('date').high.cummax().to_numpy(float); sess_lo=x.groupby('date').low.cummin().to_numpy(float)
+    rows=[]; used=set(); busy=-1
+    for r in bf.itertuples(index=False):
+        i=int(r.last_idx); ei=i+1
+        if ei>=N or D[ei]!=D[i] or st['occ'][ei]: continue
+        m=int(pd.Timestamp(T[i]).hour*60+pd.Timestamp(T[i]).minute)
+        if m<584 or m>870: continue
+        if int(r.cnt)<5 or pd.isna(r.d15) or pd.isna(r.d30) or pd.isna(r.d5): continue
+        d=int(r.d15)
+        if d==0 or int(r.d30)!=d or int(r.d5)!=-d: continue
+        if not np.isfinite(r.medr) or float(r.medr)<=0 or not np.isfinite(r.gap30): continue
+        if float(r.gap30)<0.15: continue
+        ret3n=d*float(r.ret3)/float(r.medr) if np.isfinite(r.ret3) else np.nan
+        if not np.isfinite(ret3n) or ret3n < -0.50: continue
+        rg=float(sess_hi[i]-sess_lo[i]); locup=(float(C[i])-float(sess_lo[i]))/rg if rg>0 else .5
+        dloc=locup if d==1 else 1.0-locup
+        if dloc>0.60: continue
+        dd=pd.Timestamp(T[ei]).date()
+        # realized day P&L strictly before entry timestamp
+        prior=0.0
+        if dd in byday:
+            tt,vv=byday[dd]; j=np.searchsorted(tt,pd.Timestamp(T[ei]).value,side='left')-1
+            if j>=0: prior=float(vv[j])
+        if prior < -25.0 or prior > -15.0: continue
+        if dd in used or ei<=busy: continue
+        # next higher-priority base entry strictly after this child entry
+        q=np.searchsorted(base_entries,ei,side='right'); pre=int(base_entries[q]) if q<len(base_entries) else N+1
+        ep=float(O[ei]); zend=min(int(de[ei]),ei+90,pre,N-1); mfe=0.; xp=float(C[zend]); xi=zend
+        for k in range(ei,zend+1):
+            if D[k]!=D[ei]: break
+            if k==pre: xp=float(O[k]); xi=k; break
+            floor=-10.0
+            if mfe>=15.0: floor=0.0
+            if mfe>=30.0: floor=5.0
+            sl=ep+d*floor
+            if d==1:
+                if O[k]<=sl: xp=float(O[k]);xi=k;break
+                if L[k]<=sl: xp=float(sl);xi=k;break
+                if H[k]>=ep+70.0: xp=ep+70.0;xi=k;break
+                mfe=max(mfe,float(H[k]-ep))
+            else:
+                if O[k]>=sl: xp=float(O[k]);xi=k;break
+                if H[k]>=sl: xp=float(sl);xi=k;break
+                if L[k]<=ep-70.0: xp=ep-70.0;xi=k;break
+                mfe=max(mfe,float(ep-L[k]))
+        if D[xi]!=D[ei]:
+            kk=ei
+            while kk+1<N and D[kk+1]==D[ei] and kk+1<=zend: kk+=1
+            xi=kk; xp=float(C[xi])
+        rows.append({'Module':'DAILY50_PARENT_PULL_70','Direction':'LONG' if d==1 else 'SHORT',
+                     'Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(d*(xp-ep))})
+        used.add(dd); busy=xi
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+def _daily50_late_state(base):
+    """Sparse late-session continuation rescue, evaluated after parent-pull child."""
+    F,st=_r9_feature_frame(base)
+    mgr=dict(target=60.0,cap=15,be_mfe=15.0,lock_mfe=30.0,lock_points=5.0)
+    m=(F.mn>870)&(F.mn<=900)&(F.comp15_3>1.9)&(F.gapratio15>1.4)&(F.day_p<50.0)
+    z=F.loc[m].sort_values('ei')
+    rows=[]; used=set(); busy=-1
+    for r in z.itertuples(index=False):
+        ei=int(r.ei); dd=pd.Timestamp(T[ei]).date()
+        if ei<=busy or dd in used: continue
+        xi,p=_r9_sim_one(ei,int(r.d),st,mgr)
+        rows.append({'Module':'DAILY50_LATE_STATE','Direction':'LONG' if int(r.d)==1 else 'SHORT',
+                     'Entry_Time':pd.Timestamp(T[ei]),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(p)})
+        used.add(dd); busy=xi
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+
+def _lf5_realized_maps(base):
+    """Build causal realized-P&L lookup maps from the higher-priority base only."""
+    b=base.copy()
+    b['Entry_Time']=pd.to_datetime(b.Entry_Time); b['Exit_Time']=pd.to_datetime(b.Exit_Time)
+    byday={}; byweek={}
+    for dd,g in b.groupby(b.Exit_Time.dt.normalize()):
+        gg=g.sort_values(['Exit_Time','Entry_Time','Module'],kind='mergesort')
+        byday[pd.Timestamp(dd)]=(gg.Exit_Time.astype('int64').to_numpy(),np.cumsum(gg.Points.to_numpy(float)))
+    wk=b.Exit_Time.dt.normalize()-pd.to_timedelta(b.Exit_Time.dt.weekday,unit='D')
+    for ww,g in b.groupby(wk):
+        gg=g.sort_values(['Exit_Time','Entry_Time','Module'],kind='mergesort')
+        byweek[pd.Timestamp(ww)]=(gg.Exit_Time.astype('int64').to_numpy(),np.cumsum(gg.Points.to_numpy(float)))
+    return byday,byweek
+
+
+def _lf5_prior_pnl(ts, mp):
+    ts=pd.Timestamp(ts); key=ts.normalize()
+    if mp is None or key not in mp: return 0.0
+    tt,vv=mp[key]; j=np.searchsorted(tt,ts.value,side='left')-1
+    return float(vv[j]) if j>=0 else 0.0
+
+
+def _lf5_prior_week_pnl(ts, mp):
+    ts=pd.Timestamp(ts); key=ts.normalize()-pd.Timedelta(days=ts.weekday())
+    if mp is None or key not in mp: return 0.0
+    tt,vv=mp[key]; j=np.searchsorted(tt,ts.value,side='left')-1
+    return float(vv[j]) if j>=0 else 0.0
+
+
+def _lf5_midday_quality80(base):
+    """High-quality midday missed-trend continuation child (LF5 Rule A).
+
+    All state is known at the completed 15m checkpoint. Direction is the
+    already-proven session displacement direction; paid entry is the next 1m
+    open.  Qualification is measured only from the immutable higher-priority
+    LF4 base ledger, so sibling research children never feed back into it.
+
+    Rules:
+    - completed 15m checkpoint 13:15..14:30
+    - LF4 base flat; LF4 realized day P&L <= +10 and week P&L <= +150
+    - abs(session displacement) / prior 30m median range >= 4.0
+    - abs(30m EMA19-EMA29) / prior 30m median range >= 0.60
+    - completed 30m range / prior median in [0.90, 3.00]
+    - completed 15m body/range >= 0.40
+    - price in directional outer 20% of the session range
+    - max one child/day
+    - -10 initial stop; BE after +15 MFE; +5 lock after +30 MFE
+    - +80 target; max 60 minutes; LF4 entry always pre-empts
+    """
+    st=_r7_state(df,base,False)
+    x=df[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    x['idx']=np.arange(len(x)); x['date']=x.timestamp.dt.normalize()
+    mod=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+    def _bars(tf):
+        q=x.copy(); q['bucket']=((mod-555)//tf).astype(int)
+        return q.groupby(['date','bucket'],sort=False).agg(
+            last=('idx','last'),open=('open','first'),high=('high','max'),low=('low','min'),
+            close=('close','last'),cnt=('idx','size')).reset_index()
+    b15=_bars(15); b30=_bars(30)
+    b15['ts']=[pd.Timestamp(T[int(i)]) for i in b15['last']]
+    b15['body15']=(b15.close-b15.open).abs()/(b15.high-b15.low).replace(0,np.nan)
+    b30['ts']=[pd.Timestamp(T[int(i)]) for i in b30['last']]
+    b30['rng']=b30.high-b30.low
+    b30['e19']=b30.close.ewm(span=19,adjust=False).mean(); b30['e29']=b30.close.ewm(span=29,adjust=False).mean()
+    b30['medr20']=b30.rng.shift(1).rolling(20,min_periods=10).median()
+    b30['gapnorm']=(b30.e19-b30.e29).abs()/b30.medr20
+    b30['exp30']=b30.rng/b30.medr20
+    z=pd.merge_asof(b15.sort_values('ts'),b30[['ts','medr20','gapnorm','exp30']].sort_values('ts'),on='ts',direction='backward')
+    # session state through each completed 15m bar
+    sess_open=x.groupby('date').open.first().to_dict()
+    shi=x.groupby('date').high.cummax().to_numpy(float); slo=x.groupby('date').low.cummin().to_numpy(float)
+    byday,byweek=_lf5_realized_maps(base)
+    base_entries=np.sort(np.asarray(st['ent'],dtype=int))
+    rows=[]; used=set()
+    for r in z.itertuples(index=False):
+        i=int(r.last); ei=i+1
+        if ei>=N or int(r.cnt)<15 or D[ei]!=D[i] or st['occ'][ei]: continue
+        sigts=pd.Timestamp(T[i]); mn=sigts.hour*60+sigts.minute
+        if mn<795 or mn>870: continue
+        if not (np.isfinite(r.medr20) and float(r.medr20)>0 and np.isfinite(r.gapnorm) and np.isfinite(r.exp30) and np.isfinite(r.body15)): continue
+        so=float(sess_open[pd.Timestamp(r.date)])
+        disp=float(r.close)-so; d=1 if disp>0 else -1 if disp<0 else 0
+        if d==0: continue
+        disp_norm=abs(disp)/float(r.medr20)
+        if disp_norm<4.0 or float(r.gapnorm)<0.60 or float(r.exp30)<0.90 or float(r.exp30)>3.00 or float(r.body15)<0.40: continue
+        rg=float(shi[i]-slo[i]); loc=(float(r.close)-float(slo[i]))/rg if rg>0 else .5
+        dloc=loc if d==1 else 1.0-loc
+        if dloc<0.80: continue
+        et=pd.Timestamp(T[ei]); dd=et.normalize()
+        if dd in used: continue
+        if _lf5_prior_pnl(et,byday)>10.0: continue
+        if _lf5_prior_week_pnl(et,byweek)>150.0: continue
+        q=np.searchsorted(base_entries,ei,side='right'); pre=int(base_entries[q]) if q<len(base_entries) else N+1
+        ep=float(O[ei]); zend=min(int(de[ei]),ei+60,pre,N-1); mfe=0.0; xp=float(C[zend]); xi=zend
+        for j in range(ei,zend+1):
+            if j==pre: xp=float(O[j]); xi=j; break
+            floor=-10.0
+            if mfe>=15.0: floor=0.0
+            if mfe>=30.0: floor=5.0
+            sl=ep+d*floor
+            if d==1:
+                if O[j]<=sl: xp=float(O[j]);xi=j;break
+                if L[j]<=sl: xp=float(sl);xi=j;break
+                if H[j]>=ep+80.0: xp=ep+80.0;xi=j;break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl: xp=float(O[j]);xi=j;break
+                if H[j]>=sl: xp=float(sl);xi=j;break
+                if L[j]<=ep-80.0: xp=ep-80.0;xi=j;break
+                mfe=max(mfe,float(ep-L[j]))
+        rows.append({'Module':'LF5_MIDDAY_QUALITY80','Direction':'LONG' if d==1 else 'SHORT',
+                     'Entry_Time':et,'Exit_Time':pd.Timestamp(T[xi]),'Points':float(d*(xp-ep))})
+        used.add(dd)
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+def _lf5_contraction_pull40_quality(base):
+    """Quality-filtered morning/midday contraction-pullback repair child.
+
+    It targets missed smooth trends while LF4 is flat and the LF4 realized day
+    is still non-positive.  The fast 5m state is temporarily countertrend while
+    completed 15m and 30m parents remain aligned.  Added quality filters are
+    broad and live-known: normalized 30m gap >=.20, entry checkpoint no later
+    than 12:30, and price not beyond 80% of the directional session range.
+    """
+    st=_r7_state(df,base,False)
+    x=df[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    x['idx']=np.arange(len(x)); x['date']=x.timestamp.dt.normalize()
+    mod=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+    def _bars(tf):
+        q=x.copy(); q['bucket']=((mod-555)//tf).astype(int)
+        z=q.groupby(['date','bucket'],sort=False).agg(
+            last=('idx','last'),open=('open','first'),high=('high','max'),low=('low','min'),
+            close=('close','last'),cnt=('idx','size')).reset_index()
+        z['ts']=[pd.Timestamp(T[int(i)]) for i in z['last']]
+        z['rng']=z.high-z.low
+        return z
+    b5=_bars(5); b15=_bars(15); b30=_bars(30)
+    b5['e5']=b5.close.ewm(span=5,adjust=False).mean(); b5['e21']=b5.close.ewm(span=21,adjust=False).mean(); b5['d5']=np.sign(b5.e5-b5.e21)
+    b15['e5']=b15.close.ewm(span=5,adjust=False).mean(); b15['e10']=b15.close.ewm(span=10,adjust=False).mean(); b15['d15']=np.sign(b15.e5-b15.e10)
+    b15['medr20']=b15.rng.shift(1).rolling(20,min_periods=10).median(); b15['gap15n']=(b15.e5-b15.e10).abs()/b15.medr20
+    b30['e19']=b30.close.ewm(span=19,adjust=False).mean(); b30['e29']=b30.close.ewm(span=29,adjust=False).mean(); b30['d30']=np.sign(b30.e19-b30.e29)
+    b30['medr20']=b30.rng.shift(1).rolling(20,min_periods=10).median(); b30['exp30']=b30.rng/b30.medr20; b30['gap30n']=(b30.e19-b30.e29).abs()/b30.medr20
+    z=pd.merge_asof(b5.sort_values('ts'),b15[['ts','d15','gap15n']].sort_values('ts'),on='ts',direction='backward')
+    z=pd.merge_asof(z,b30[['ts','d30','exp30','gap30n']].sort_values('ts'),on='ts',direction='backward')
+    shi=x.groupby('date').high.cummax().to_numpy(float); slo=x.groupby('date').low.cummin().to_numpy(float)
+    byday,_=_lf5_realized_maps(base)
+    base_entries=np.sort(np.asarray(st['ent'],dtype=int))
+    rows=[]; used=set()
+    for r in z.itertuples(index=False):
+        i=int(r.last); ei=i+1
+        if ei>=N or int(r.cnt)<5 or D[ei]!=D[i] or st['occ'][ei]: continue
+        sigts=pd.Timestamp(T[i]); mn=sigts.hour*60+sigts.minute
+        if mn<600 or mn>750: continue
+        if not (np.isfinite(r.d15) and np.isfinite(r.d30) and np.isfinite(r.d5) and np.isfinite(r.exp30) and np.isfinite(r.gap15n) and np.isfinite(r.gap30n)): continue
+        d=int(r.d15)
+        if d==0 or int(r.d30)!=d or int(r.d5)!=-d: continue
+        if float(r.exp30)<0.35 or float(r.exp30)>0.50 or float(r.gap15n)<0.10 or float(r.gap30n)<0.20: continue
+        rg=float(shi[i]-slo[i]); loc=(float(r.close)-float(slo[i]))/rg if rg>0 else .5
+        dloc=loc if d==1 else 1.0-loc
+        if dloc>0.80: continue
+        et=pd.Timestamp(T[ei]); dd=et.normalize()
+        if dd in used or _lf5_prior_pnl(et,byday)>0.0: continue
+        q=np.searchsorted(base_entries,ei,side='right'); pre=int(base_entries[q]) if q<len(base_entries) else N+1
+        ep=float(O[ei]); zend=min(int(de[ei]),ei+30,pre,N-1); mfe=0.0; xp=float(C[zend]); xi=zend
+        for j in range(ei,zend+1):
+            if j==pre: xp=float(O[j]);xi=j;break
+            floor=-10.0
+            if mfe>=15.0: floor=0.0
+            if mfe>=30.0: floor=5.0
+            sl=ep+d*floor
+            if d==1:
+                if O[j]<=sl: xp=float(O[j]);xi=j;break
+                if L[j]<=sl: xp=float(sl);xi=j;break
+                if H[j]>=ep+40.0: xp=ep+40.0;xi=j;break
+                mfe=max(mfe,float(H[j]-ep))
+            else:
+                if O[j]>=sl: xp=float(O[j]);xi=j;break
+                if H[j]>=sl: xp=float(sl);xi=j;break
+                if L[j]<=ep-40.0: xp=ep-40.0;xi=j;break
+                mfe=max(mfe,float(ep-L[j]))
+        rows.append({'Module':'LF5_CONTRACTION_PULL40_Q','Direction':'LONG' if d==1 else 'SHORT',
+                     'Entry_Time':et,'Exit_Time':pd.Timestamp(T[xi]),'Points':float(d*(xp-ep))})
+        used.add(dd)
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+
+# -----------------------------------------------------------------------------
+# LF6 missed-trend repair layers.
+# All features below are rebuilt from current raw 1-minute input. No historical
+# trade rows, timestamps, labels, or research ledgers are embedded/read.
+# Layer priority: LF5 -> Q repeat -> late-red pull -> strong-parent repeat.
+# -----------------------------------------------------------------------------
+
+def _lf6_5m_feature_frame(base, start_min=585, end_min=870, need_prev=True):
+    st=_r7_state(df,base,False)
+    x=df[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    x['idx']=np.arange(len(x)); x['date']=x.timestamp.dt.normalize(); x['mn']=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+    def _bars(tf):
+        q=x.copy(); q['bucket']=((q.mn-555)//tf).astype(int)
+        z=q.groupby(['date','bucket'],sort=True).agg(last=('idx','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),cnt=('idx','size')).reset_index()
+        z['ts']=pd.to_datetime(T[z['last'].to_numpy(int)]); z['range']=z.high-z.low
+        return z
+    q5,q15,q30=_bars(5),_bars(15),_bars(30)
+    for q,fa,sl in [(q5,5,21),(q15,5,10),(q30,19,29)]:
+        q['ef']=q.close.ewm(span=fa,adjust=False).mean(); q['es']=q.close.ewm(span=sl,adjust=False).mean()
+        q['d']=np.sign(q.ef-q.es).astype(int)
+        q['med']=q['range'].shift(1).rolling(20,min_periods=10).median().replace(0,np.nan)
+        q['gapn']=(q.ef-q.es).abs()/q.med
+    q5['body_signed']=(q5.close-q5.open)/q5['range'].replace(0,np.nan)
+    q5['ret1']=(q5.close-q5.close.shift(1))/q5.med
+    q5['ret3']=(q5.close-q5.close.shift(3))/q5.med
+    q5['ret6']=(q5.close-q5.close.shift(6))/q5.med
+    # completed higher-timeframe state only
+    z=pd.merge_asof(q5.sort_values('ts'),q15[['ts','d','gapn']].rename(columns={'d':'d15','gapn':'gap15'}).sort_values('ts'),on='ts',direction='backward')
+    z=pd.merge_asof(z,q30[['ts','d','gapn']].rename(columns={'d':'d30','gapn':'gap30'}).sort_values('ts'),on='ts',direction='backward')
+    # session starts/range
+    dates=x.date.to_numpy(); starts=np.r_[0,np.flatnonzero(dates[1:]!=dates[:-1])+1].astype(int)
+    ds=np.empty(len(x),np.int64)
+    ends=np.r_[starts[1:]-1,len(x)-1]
+    for s,e in zip(starts,ends): ds[s:e+1]=s
+    # previous-day range context, known before today's open
+    dday=x.groupby('date',sort=True).agg(high=('high','max'),low=('low','min')).reset_index()
+    prev={}; hist=[]
+    for ii in range(1,len(dday)):
+        med=np.median(hist[-10:]) if len(hist)>=5 else np.nan
+        pr=float(dday.high.iloc[ii-1]-dday.low.iloc[ii-1])
+        prev[pd.Timestamp(dday.date.iloc[ii])]=(float(dday.high.iloc[ii-1]),float(dday.low.iloc[ii-1]),float(pr/med) if np.isfinite(med) and med>0 else np.nan)
+        hist.append(pr)
+    base_entries=np.sort(np.asarray(st['ent'],dtype=np.int64))
+    rows=[]
+    for a in z.itertuples(index=False):
+        i=int(a.last); ei=i+1
+        if ei>=N or int(a.cnt)<5 or D[ei]!=D[i] or st['occ'][ei]: continue
+        et=pd.Timestamp(T[ei]); mn=et.hour*60+et.minute
+        if mn<start_min or mn>end_min: continue
+        med=float(a.med) if np.isfinite(a.med) and float(a.med)>0 else np.nan
+        if not np.isfinite(med): continue
+        d=int(a.d)
+        if d==0: continue
+        s=int(ds[i]); hh=float(np.max(H[s:i+1])); ll=float(np.min(L[s:i+1])); rg=hh-ll
+        loc=(float(C[i])-ll)/rg if rg>0 else .5; dloc=loc if d==1 else 1.0-loc
+        disp=float(d*(C[i]-O[s])/med)
+        ph,pl,pr=prev.get(pd.Timestamp(x.date.iloc[i]),(np.nan,np.nan,np.nan))
+        distprev=((float(C[i])-ph)/med if d==1 else (pl-float(C[i]))/med) if np.isfinite(ph) and np.isfinite(pl) else np.nan
+        q=np.searchsorted(base_entries,ei,side='right'); nb=int(base_entries[q]) if q<len(base_entries) else N+1
+        rows.append(dict(i=i,ei=ei,Entry_Time=et,d=d,mn=mn,day=int(D[ei]),week=int(W[ei]),
+                         dayp=float(st['live_day'][i]),weekp=float(st['live_week'][i]),
+                         d15=int(a.d15) if np.isfinite(a.d15) else 0,d30=int(a.d30) if np.isfinite(a.d30) else 0,
+                         gap15=float(a.gap15) if np.isfinite(a.gap15) else np.nan,gap30=float(a.gap30) if np.isfinite(a.gap30) else np.nan,
+                         bodydir=d*float(a.body_signed) if np.isfinite(a.body_signed) else np.nan,
+                         ret1=d*float(a.ret1) if np.isfinite(a.ret1) else np.nan,ret3=d*float(a.ret3) if np.isfinite(a.ret3) else np.nan,
+                         ret6=d*float(a.ret6) if np.isfinite(a.ret6) else np.nan,dloc=float(dloc),disp=float(disp),distprev=float(distprev),prevratio=float(pr),nextb=nb))
+    return pd.DataFrame(rows)
+
+
+def _lf6_manage(ei,d,next_base,target,cap,be_mfe,lock_mfe,lock_pts):
+    ep=float(O[ei]); zend=min(int(de[ei]),ei+int(cap),int(next_base),N-1)
+    mfe=0.0; xp=float(C[zend]); xi=zend
+    for j in range(ei,zend+1):
+        if j==next_base:
+            xp=float(O[j]); xi=j; break
+        floor=-10.0
+        if mfe>=float(be_mfe): floor=0.0
+        if mfe>=float(lock_mfe): floor=float(lock_pts)
+        sl=ep+d*floor
+        if d==1:
+            if O[j]<=sl: xp=float(O[j]); xi=j; break
+            if L[j]<=sl: xp=float(sl); xi=j; break
+            if H[j]>=ep+target: xp=ep+target; xi=j; break
+            mfe=max(mfe,float(H[j]-ep))
+        else:
+            if O[j]>=sl: xp=float(O[j]); xi=j; break
+            if H[j]>=sl: xp=float(sl); xi=j; break
+            if L[j]<=ep-target: xp=ep-target; xi=j; break
+            mfe=max(mfe,float(ep-L[j]))
+    return xi,float(d*(xp-ep))
+
+
+def _lf6_q_repeat50(base):
+    """Quality repeated short capture in an already extreme directional state."""
+    F=_lf6_5m_feature_frame(base,585,870)
+    if F.empty: return pd.DataFrame(columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+    F=F[(F.prevratio>=.70)&(F.disp>=-6.0)&(F.distprev>=14.0)&(F.gap15>=.50)].sort_values('Entry_Time')
+    rows=[]; cnt={}; childday={}; lastx={}
+    for a in F.itertuples(index=False):
+        dd=int(a.day)
+        if cnt.get(dd,0)>=3: continue
+        if dd in lastx and a.Entry_Time < lastx[dd]+pd.Timedelta(minutes=30): continue
+        if float(a.dayp)+childday.get(dd,0.0)>0.0: continue
+        xi,p=_lf6_manage(int(a.ei),int(a.d),int(a.nextb),50.0,60,15.0,30.0,5.0)
+        rows.append({'Module':'LF6_D5_EXTREME_REPEAT50_Q','Direction':'LONG' if int(a.d)==1 else 'SHORT','Entry_Time':a.Entry_Time,'Exit_Time':pd.Timestamp(T[xi]),'Points':p})
+        cnt[dd]=cnt.get(dd,0)+1; childday[dd]=childday.get(dd,0.0)+p; lastx[dd]=pd.Timestamp(T[xi])
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+def _lf6_late_red_pull40(base):
+    """Late red-day pull/resumption repair. Own realized P&L updates later week gate."""
+    F=_lf6_5m_feature_frame(base,870,900)
+    if F.empty: return pd.DataFrame(columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+    rows=[]; used=set(); ownweek={}
+    for a in F.sort_values('Entry_Time').itertuples(index=False):
+        dd=int(a.day); ww=int(a.week)
+        if dd in used: continue
+        ed=float(a.dayp)
+        ew=float(a.weekp)+ownweek.get(ww,0.0)
+        if not (np.isfinite(a.ret3) and float(a.ret3)<=-0.2 and ed<=-25.0 and np.isfinite(a.ret1) and float(a.ret1)<=0.1 and ew<=50.0): continue
+        xi,p=_lf6_manage(int(a.ei),int(a.d),int(a.nextb),40.0,45,15.0,30.0,5.0)
+        rows.append({'Module':'LF6_LATE_RED_PULL40','Direction':'LONG' if int(a.d)==1 else 'SHORT','Entry_Time':a.Entry_Time,'Exit_Time':pd.Timestamp(T[xi]),'Points':p})
+        used.add(dd); ownweek[ww]=ownweek.get(ww,0.0)+p
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+def _lf6_strong_parent_repeat50(base):
+    """Sparse high-PF repeated capture in strong 30m parent state."""
+    F=_lf6_5m_feature_frame(base,585,870)
+    if F.empty: return pd.DataFrame(columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+    F=F[(F.gap30>=1.20)&(F.distprev>=11.0)&(F.ret6<=1.20)&(F.prevratio<=1.0)].sort_values('Entry_Time')
+    rows=[]; cnt={}; childday={}; lastx={}
+    for a in F.itertuples(index=False):
+        dd=int(a.day)
+        if cnt.get(dd,0)>=3: continue
+        if dd in lastx and a.Entry_Time < lastx[dd]+pd.Timedelta(minutes=30): continue
+        if float(a.dayp)+childday.get(dd,0.0)>0.0: continue
+        xi,p=_lf6_manage(int(a.ei),int(a.d),int(a.nextb),50.0,60,15.0,30.0,5.0)
+        rows.append({'Module':'LF6_STRONG_PARENT_REPEAT50','Direction':'LONG' if int(a.d)==1 else 'SHORT','Entry_Time':a.Entry_Time,'Exit_Time':pd.Timestamp(T[xi]),'Points':p})
+        cnt[dd]=cnt.get(dd,0)+1; childday[dd]=childday.get(dd,0.0)+p; lastx[dd]=pd.Timestamp(T[xi])
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+# -----------------------------------------------------------------------------
+# LF8 MISSED-TREND REPAIR
+# Two orthogonal, live-causal rescue routes discovered from broad rounded-rule
+# searches, then cross-checked in 2015-2019 and 2020-2026.  No dates/outcomes
+# are embedded.  Both routes are generated only from raw minute data + realized
+# live engine state known at the completed-candle decision time.
+# -----------------------------------------------------------------------------
+def _lf8_feature_frame(base, start_min=585, end_min=885):
+    st=_r7_state(df,base,False)
+    x=df[['timestamp','open','high','low','close']].copy().reset_index(drop=True)
+    x['idx']=np.arange(len(x)); x['date']=x.timestamp.dt.normalize(); x['mn']=x.timestamp.dt.hour*60+x.timestamp.dt.minute
+    def _bars(tf):
+        q=x.copy(); q['bucket']=((q.mn-555)//tf).astype(int)
+        z=q.groupby(['date','bucket'],sort=True).agg(last=('idx','last'),open=('open','first'),high=('high','max'),low=('low','min'),close=('close','last'),cnt=('idx','size')).reset_index()
+        z['ts']=pd.to_datetime(T[z['last'].to_numpy(int)]); z['range']=z.high-z.low
+        return z
+    q5,q15,q30=_bars(5),_bars(15),_bars(30)
+    for q,fa,sl in [(q5,5,21),(q15,5,10),(q30,19,29)]:
+        q['ef']=q.close.ewm(span=fa,adjust=False).mean(); q['es']=q.close.ewm(span=sl,adjust=False).mean()
+        q['d']=np.sign(q.ef-q.es).astype(int)
+        q['med']=q['range'].shift(1).rolling(20,min_periods=10).median().replace(0,np.nan)
+        q['gapn']=(q.ef-q.es).abs()/q.med
+    q5['exp5']=q5['range']/q5.med
+    q5['body_signed']=(q5.close-q5.open)/q5['range'].replace(0,np.nan)
+    for n in (2,3):
+        q5[f'ph{n}']=q5.high.shift(1).rolling(n,min_periods=n).max()
+        q5[f'pl{n}']=q5.low.shift(1).rolling(n,min_periods=n).min()
+    z=pd.merge_asof(q5.sort_values('ts'),q15[['ts','d','gapn']].rename(columns={'d':'d15','gapn':'gap15'}).sort_values('ts'),on='ts',direction='backward')
+    z=pd.merge_asof(z,q30[['ts','d','gapn']].rename(columns={'d':'d30','gapn':'gap30'}).sort_values('ts'),on='ts',direction='backward')
+    # Previous close is known before today's session opens.
+    day=x.groupby('date',sort=True).agg(day_open=('open','first'),day_close=('close','last')).reset_index()
+    day['prev_close']=day.day_close.shift(1)
+    z=z.merge(day[['date','day_open','prev_close']],on='date',how='left')
+    # Completed session range through each 5m close.
+    gx=x.groupby('date',sort=False)
+    chi=gx.high.cummax().to_numpy(float); clo=gx.low.cummin().to_numpy(float)
+    li=z['last'].to_numpy(int); z['cumhi']=chi[li]; z['cumlo']=clo[li]
+    sr=(z.cumhi-z.cumlo).replace(0,np.nan); z['loclong']=(z.close-z.cumlo)/sr
+    z['ei']=z['last'].astype(int)+1; z=z[z.ei<N].copy()
+    if z.empty: return pd.DataFrame()
+    # next-minute fill must remain in same regular session.
+    zv=z.ei.to_numpy(int); lv=z['last'].to_numpy(int)
+    z=z[D[zv]==D[lv]].copy()
+    if z.empty: return pd.DataFrame()
+    z['Entry_Time']=pd.to_datetime(T[z.ei.to_numpy(int)])
+    z['mn']=z.Entry_Time.dt.hour*60+z.Entry_Time.dt.minute
+    z=z[(z.mn>=int(start_min))&(z.mn<=int(end_min))].copy()
+    if z.empty: return pd.DataFrame()
+    z['dir']=np.where((z.d15==z.d30)&(z.d30!=0),z.d30,0).astype(int)
+    z=z[z.dir!=0].copy()
+    if z.empty: return pd.DataFrame()
+    z['d5align']=(z.d==z.dir)
+    z['bodydir']=z.dir*z.body_signed
+    z['dloc']=np.where(z.dir==1,z.loclong,1-z.loclong)
+    z['pcdir']=z.dir*(z.close-z.prev_close)
+    z['disp']=z.dir*(z.close-z.day_open)/z.med
+    z['gap5']=z.gapn
+    for n in (2,3): z[f'bo{n}']=np.where(z.dir==1,z.close-z[f'ph{n}'],z[f'pl{n}']-z.close)
+    # Realized P&L is sampled at the completed 5m decision bar, before next-open fill.
+    ii=z['last'].to_numpy(int)
+    z['dayp']=st['live_day'][ii]; z['weekp']=st['live_week'][ii]
+    z['occupied']=st['occ'][z.ei.to_numpy(int)]
+    ents=np.sort(np.asarray(st['ent'],dtype=np.int64))
+    nbs=[]
+    for ei in z.ei.to_numpy(int):
+        k=np.searchsorted(ents,ei,side='right'); nbs.append(int(ents[k]) if k<len(ents) else N+1)
+    z['nextb']=nbs
+    z['day']=D[z.ei.to_numpy(int)]; z['week']=W[z.ei.to_numpy(int)]
+    return z
+
+
+def _lf8_morning_bear_break40(base):
+    """Morning bearish trend rescue; max one per day, 09:45-12:30."""
+    F=_lf8_feature_frame(base,585,750)
+    if F.empty: return pd.DataFrame(columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+    F=F[(F.dir==-1)&(F.d5align)&(~F.occupied)&
+        (F.bo3>=0.0)&(F.bo2<=5.0)&(F.pcdir>=0.0)&
+        (F.bodydir>=0.30)&(F.exp5>=0.50)&
+        (F.gap30>=0.05)&(F.gap15<=1.20)&
+        (F.dloc>=0.50)&(F.dloc<=0.90)&
+        (F.dayp<=-10.0)&(F.weekp<=50.0)].sort_values('Entry_Time')
+    rows=[]; used=set()
+    for a in F.itertuples(index=False):
+        dd=int(a.day)
+        if dd in used: continue
+        xi,p=_lf6_manage(int(a.ei),-1,int(a.nextb),40.0,60,15.0,30.0,5.0)
+        rows.append({'Module':'LF8_MORNING_BEAR_BREAK40','Direction':'SHORT','Entry_Time':pd.Timestamp(a.Entry_Time),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(p)})
+        used.add(dd)
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+
+def _lf8_late_displacement40(base):
+    """Late aligned displacement rescue; evaluated after morning child is realized."""
+    F=_lf8_feature_frame(base,690,885)
+    if F.empty: return pd.DataFrame(columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+    F=F[(F.d==F.d15)&(F.d==F.d30)&(~F.occupied)&
+        (F.disp>=7.0)&(F.gap5<=0.50)&(F.gap30>=0.20)&(F.dloc>=0.60)&
+        (F.dayp<=-20.0)&(F.weekp<=50.0)].sort_values('Entry_Time')
+    rows=[]; used=set()
+    for a in F.itertuples(index=False):
+        dd=int(a.day)
+        if dd in used: continue
+        xi,p=_lf6_manage(int(a.ei),int(a.d),int(a.nextb),40.0,45,15.0,30.0,5.0)
+        rows.append({'Module':'LF8_LATE_DISPLACEMENT40','Direction':'LONG' if int(a.d)==1 else 'SHORT','Entry_Time':pd.Timestamp(a.Entry_Time),'Exit_Time':pd.Timestamp(T[xi]),'Points':float(p)})
+        used.add(dd)
+    return pd.DataFrame(rows,columns=['Module','Direction','Entry_Time','Exit_Time','Points'])
+
+def run_engine(args):
+    sdf, r7, r7_summary = _run_r7_engine(args, return_frames=True)
+    _r8_prepare_runtime(sdf)
+    r8_layers=[]; base=r7
+    for name,fn in [
+        ('R8_1_REARM',_r8_layer1),
+        ('R8_2_15M_LONG_SHORT_CHILD',_r8_layer2),
+        ('R8_SHADOW_LONG',_r8_shadow),
+        ('R8_5_GAP_OR30',_r8_gap_or30),
+        ('R8_OPENING_DRIVE_SHORT',_r8_opening_drive),
+        ('R8_PULLBACK_RECLAIM_HQ',_r8_pullback_hq),
+    ]:
+        z=fn(base); r8_layers.append((name,z)); base=_r8_combine(base,z)
+    for cfg in [
+        ('R8_COUNTERSWING_RECLAIM',-1,5,40,.65,1.5,True,1,60,15,585,870),
+        ('R8_LATE_COUNTER_RECLAIM',-1,5,30,.65,1.5,False,2,40,15,840,870),
+        ('R8_MIDDAY_LONG_TRANSITION',1,4,30,.65,2.0,False,2,40,20,660,750),
+        ('R8_LATE_LONG_TRANSITION',1,6,40,.75,2.0,False,0,40,15,840,870),
+    ]:
+        name=cfg[0]; z=_r8_transition(base,*cfg); r8_layers.append((name,z)); base=_r8_combine(base,z)
+    r8_final=base.sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    r9=_r9_layer(r8_final)
+    base_with_r9=_r8_combine(r8_final,r9).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    lf15=_lf15_exp_ret_child(base_with_r9)
+    base_with_lf1=_r8_combine(base_with_r9,lf15).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    lf15c=_lf15_comp_child(base_with_lf1)
+    base_with_lf2=_r8_combine(base_with_lf1,lf15c).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    lf5p=_lf5_fresh_pullback_child(base_with_lf2)
+    base_lf3=_r8_combine(base_with_lf2,lf5p).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    daily70=_daily50_parent_pull_70(base_lf3)
+    base_daily70=_r8_combine(base_lf3,daily70).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    daily_late=_daily50_late_state(base_daily70)
+    lf4_final=_r8_combine(base_daily70,daily_late).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    # LF5 children are independently qualified from the immutable LF4 state.
+    # This keeps each rule live-causal while preventing sibling P&L from
+    # retroactively changing the other rule's historical qualification.
+    lf5_midday=_lf5_midday_quality80(lf4_final)
+    lf5_contract=_lf5_contraction_pull40_quality(lf4_final)
+    lf5_final=_r8_combine(_r8_combine(lf4_final,lf5_midday),lf5_contract).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    lf6_q=_lf6_q_repeat50(lf5_final)
+    base_lf6_q=_r8_combine(lf5_final,lf6_q).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    lf6_late=_lf6_late_red_pull40(base_lf6_q)
+    base_lf6_late=_r8_combine(base_lf6_q,lf6_late).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    lf6_sp=_lf6_strong_parent_repeat50(base_lf6_late)
+    lf7_final=_r8_combine(base_lf6_late,lf6_sp).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    lf8_morning=_lf8_morning_bear_break40(lf7_final)
+    base_lf8_morning=_r8_combine(lf7_final,lf8_morning).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+    lf8_late=_lf8_late_displacement40(base_lf8_morning)
+    final=_r8_combine(base_lf8_morning,lf8_late).sort_values(['Exit_Time','Entry_Time','Module']).reset_index(drop=True)
+
+    fm=_r7_metrics_detail(final); counts=_r7_period_counts(sdf,final)
+    r9m=_r7_metrics_detail(r9) if len(r9) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.}
+    r8m=_r7_metrics_detail(r8_final)
+    yy=pd.to_datetime(final.Exit_Time).dt.year; yearly=[]
+    for y in sorted(yy.unique()):
+        z=final[yy==y]; yearly.append({'year':int(y),'points':float(z.Points.sum()),'trades':int(len(z))})
+    summary={
+      'engine':'NIFTY_R9_LF8_47174_90_RULES_ONLY_ENGINE_ITM3',
+      'status':'R9_LF8_47174_90_LOCKED_RAW_MINUTE_REPLAY',
+      'combined':fm,'daily':counts['daily'],'weekly':counts['weekly'],'yearly':yearly,
+      'r8_base':r8m,'r9_layer':r9m,'lf15_child':_r7_metrics_detail(lf15) if len(lf15) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf15_comp_child':_r7_metrics_detail(lf15c) if len(lf15c) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf5_fresh_pullback_child':_r7_metrics_detail(lf5p) if len(lf5p) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'daily50_parent_pull_70':_r7_metrics_detail(daily70) if len(daily70) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'daily50_late_state':_r7_metrics_detail(daily_late) if len(daily_late) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf5_midday_quality80':_r7_metrics_detail(lf5_midday) if len(lf5_midday) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf5_contraction_pull40_q':_r7_metrics_detail(lf5_contract) if len(lf5_contract) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf6_d5_extreme_repeat50_q':_r7_metrics_detail(lf6_q) if len(lf6_q) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf6_late_red_pull40':_r7_metrics_detail(lf6_late) if len(lf6_late) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf6_strong_parent_repeat50':_r7_metrics_detail(lf6_sp) if len(lf6_sp) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf8_morning_bear_break40':_r7_metrics_detail(lf8_morning) if len(lf8_morning) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},'lf8_late_displacement40':_r7_metrics_detail(lf8_late) if len(lf8_late) else {'net':0.,'pf':None,'dd':0.,'trades':0,'win_rate':0.},
+      'r9_rules':R9_RULES,
+      'management':_R9_MANAGERS,
+      'integrity':{
+        'raw_minute_only':True,
+        'historical_trade_rows_embedded':False,
+        'historical_timestamps_embedded':False,
+        'precomputed_pnl_embedded':False,
+        'date_specific_fixes':False,
+        'completed_bar_next_minute_fills':True,
+        'minimum_paid_initial_stop_points':10.0,
+        'r9_overlap_allowed':False,
+        'strong_week_cont_max_per_day':1,
+      }
+    }
+    print(json.dumps(summary,indent=2,default=str))
+    if args.out:
+        from pathlib import Path
+        out=Path(args.out);out.mkdir(parents=True,exist_ok=True)
+        final.to_csv(out/'all_generated.csv',index=False)
+        r8_final.to_csv(out/'r8_base_generated.csv',index=False)
+        r9.to_csv(out/'r9_layer_generated.csv',index=False)
+        lf15.to_csv(out/'lf15_child_generated.csv',index=False)
+        lf15c.to_csv(out/'lf15_comp_child_generated.csv',index=False)
+        lf5p.to_csv(out/'lf5_fresh_pullback_child_generated.csv',index=False)
+        daily70.to_csv(out/'daily50_parent_pull_70_generated.csv',index=False)
+        daily_late.to_csv(out/'daily50_late_state_generated.csv',index=False)
+        lf5_midday.to_csv(out/'lf5_midday_quality80_generated.csv',index=False)
+        lf5_contract.to_csv(out/'lf5_contraction_pull40_q_generated.csv',index=False)
+        lf6_q.to_csv(out/'lf6_d5_extreme_repeat50_q_generated.csv',index=False)
+        lf6_late.to_csv(out/'lf6_late_red_pull40_generated.csv',index=False)
+        lf6_sp.to_csv(out/'lf6_strong_parent_repeat50_generated.csv',index=False)
+        lf8_morning.to_csv(out/'lf8_morning_bear_break40_generated.csv',index=False)
+        lf8_late.to_csv(out/'lf8_late_displacement40_generated.csv',index=False)
+        (out/'summary.json').write_text(json.dumps(summary,indent=2,default=str))
+
+
 def main():
     import argparse
-    ap=argparse.ArgumentParser(description='Standalone rules-only NIFTY R7 engine')
+    ap=argparse.ArgumentParser(description='Standalone rules-only NIFTY R9 LF7 rebuilt exact-replay engine')
     ap.add_argument('--nifty',required=True,help='raw NIFTY 1-minute CSV or ZIP')
     ap.add_argument('--start',required=True);ap.add_argument('--end',required=True,help='exclusive end')
-    ap.add_argument('--out',default=None,help='optional output directory for generated runtime reports')
+    ap.add_argument('--out',default=None,help='optional output directory')
     run_engine(ap.parse_args())
 
 if __name__=='__main__': main()
