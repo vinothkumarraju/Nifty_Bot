@@ -57,6 +57,11 @@ jobs:
           test -f NIFTY_LIVE_ENGINE.py || { echo "::error::NIFTY_LIVE_ENGINE.py missing from repository root"; exit 1; }
           echo "Required live files found."
 
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          python -m py_compile NIFTY_RULES_ONLY_ENGINE.py NIFTY_LIVE_ENGINE.py
+
       - name: Install dependencies
         shell: bash
         run: |
@@ -94,7 +99,7 @@ jobs:
           print('Telegram bot token and chat ID validated.')
           PY2
 
-      - name: Run NIFTY R7 live check
+      - name: Run NIFTY R9-LF8 live check
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
